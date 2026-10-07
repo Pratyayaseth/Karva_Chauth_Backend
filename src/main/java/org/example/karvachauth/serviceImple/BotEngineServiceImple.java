@@ -180,8 +180,9 @@ public class BotEngineServiceImple implements BotEngineService {
     //   she taps "I'm celebrating" / …        → path saved, "Choose my gift" / … sent — still OPENER
     //   she taps "Choose my gift" / "Find her a gift" / "Show me"
     //                                         → W_CHOOSE_MY_GIFT / H_FIND_HER_GIFT / S_SHOW_ME
+    //   or she taps "Visit nearby store"      → BOOK_STORE_VISIT (C2)
     //
-    // So until she taps the path's first button she shows as OPENER everywhere.
+    // So until she taps one of those two buttons she shows as OPENER everywhere.
     // ==================================================================
 
     /**
@@ -252,8 +253,8 @@ public class BotEngineServiceImple implements BotEngineService {
      *   2. Her tap is saved on OPENER, with the button's payload and text.
      *   3. "Choose my gift" / "Find her a gift" / "Show me" is sent, also saved on OPENER.
      *
-     * The session STAYS on OPENER — it moves to W_CHOOSE_MY_GIFT / H_FIND_HER_GIFT / S_SHOW_ME only
-     * when she taps that button (onButtonTap).
+     * The session STAYS on OPENER — it moves to W_CHOOSE_MY_GIFT / H_FIND_HER_GIFT / S_SHOW_ME when she
+     * taps that button, or to BOOK_STORE_VISIT when she taps "Visit nearby store" (onButtonTap).
      *
      * payload = null when started from /test (no real tap) — then step 2 is skipped.
      */
@@ -389,8 +390,11 @@ public class BotEngineServiceImple implements BotEngineService {
         boolean handled = false;
 
         // Shared buttons — same behaviour on every path
-        if ("BTN_STORE_FINDER".equals(p)) {
-            log.info("stage=NOT_BUILT payload={} (C2 Book a store visit)", p);
+        if (isStoreVisitTap(p)) {
+            // C2 — session is now on BOOK_STORE_VISIT (stepForTap). The booking form goes here once built;
+            // for a product card, p.substring(6) is the SKU to reserve.
+            log.info("stage=NOT_BUILT sessionId={} payload={} step={} (C2 Book a store visit — form not sent yet)",
+                    session.getId(), p, session.getCurrentStep());
         } else if ("TEST_C2_BOOKED".equals(p)) {
             // TEST ONLY — pretends the C2 booking just completed, so 1I can be tested before C2 exists.
             // No real button ever sends this. Delete this branch once C2 is built.
@@ -474,11 +478,19 @@ public class BotEngineServiceImple implements BotEngineService {
      *   "Choose my gift" / "Find her a gift" / "Show me"  → W_CHOOSE_MY_GIFT / H_FIND_HER_GIFT / S_SHOW_ME
      *   a category ("Browse these", CAT_*)                → W_PICK_CATEGORY / H_PICK_CATEGORY / S_PICK_CATEGORY
      *
+     *   "Visit nearby store" / "Visit Store" (BTN_STORE_FINDER, VISIT_<sku>) → BOOK_STORE_VISIT, on every path
+     *
      * The reply then moves the session on (products → W_BROWSE_PRODUCTS, budget list → H_BUDGET / S_BUDGET),
      * but the tap and the reply stay saved on the step she chose.
+     *
+     * C2 (Book a store visit): the store tap and the booking form sent after it are both saved on
+     * BOOK_STORE_VISIT — that step means "started booking". The booking is complete only when she submits
+     * the form: that writes a Booking row and a STORE_VISIT_BOOKED lead, sends the confirmed card, and then
+     * afterStoreVisitBooked() moves her on (1I / 2E).
      */
     private static String stepForTap(String path, String p) {
         if (path == null) return null;
+        if (isStoreVisitTap(p)) return STEP_BOOK_STORE_VISIT;
         boolean category = p.startsWith("CAT_");
         return switch (path) {
             case TEMPLATE_WIFE    -> "W_CHOOSE_MY_GIFT".equals(p) ? STEP_W_CHOOSE_MY_GIFT
@@ -489,6 +501,11 @@ public class BotEngineServiceImple implements BotEngineService {
                     : category ? STEP_S_PICK_CATEGORY : null;
             default -> null;
         };
+    }
+
+    /** "Visit nearby store" / "📍 Visit Store" (BTN_STORE_FINDER) or "Visit Store" on a product card (VISIT_<sku>). */
+    private static boolean isStoreVisitTap(String p) {
+        return "BTN_STORE_FINDER".equals(p) || p.startsWith("VISIT_");
     }
 
     // ==================================================================

@@ -14,9 +14,11 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 import static org.example.karvachauth.constants.KarvaChauthConstants.*;
@@ -29,6 +31,7 @@ public class DashboardServiceImple implements DashboardService {
     private final DashboardRepository dashboardRepo;
 
     private static final DateTimeFormatter ISO_DATE = DateTimeFormatter.ISO_LOCAL_DATE;
+    private static final DateTimeFormatter DAY_MONTH = DateTimeFormatter.ofPattern("d MMM", Locale.ENGLISH);
     private static final int MAX_ACTIVITY_LIMIT = 50;
 
     // Message statuses
@@ -46,6 +49,8 @@ public class DashboardServiceImple implements DashboardService {
     private static final String TAP_CATEGORY_PREFIX = "CAT_";
     private static final String TAP_HUSBAND_BUDGET_PREFIX = "H_BUDGET_";
     private static final String TAP_SPARKLE_BUDGET_PREFIX = "S_BUDGET_";
+    private static final String TAP_HUSBAND_BUY_PREFIX = "BUY_";
+    private static final String TAP_PRODUCT_VISIT_PREFIX = "VISIT_";
 
     // Product carousel step per path
     private static final List<String> ALL_CAROUSEL_STEPS =
@@ -53,7 +58,6 @@ public class DashboardServiceImple implements DashboardService {
 
     // Product pick actions
     private static final List<String> ADDED_ACTION = List.of(PICK_ADDED);
-    private static final List<String> SELECTED_ACTION = List.of(PICK_SELECTED);
     private static final List<String> CHOSE_PIECE_ACTIONS = List.of(PICK_ADDED, PICK_SELECTED);
 
     // Referral leads (partner details captured)
@@ -221,7 +225,12 @@ public class DashboardServiceImple implements DashboardService {
         return stages;
     }
 
-    /** "Shopping for her" — category → budget → products → one piece → buy online → her details. */
+    /**
+     * "Shopping for her" — category → budget → products → buy or visit → her details.
+     * Buy / Visit = "Buy this for her" or "Visit nearby store" on a product card.
+     * Her Details Ask = 2E sent ("shall we remember her birthday?"); Her Details = name, birthday and
+     * mobile given (consent asked); Consent = she agreed, mobile kept.
+     */
     private List<Map<String, Object>> buildHusbandStages(DateWindow window, long openerTaps) {
         String husband = TEMPLATE_HUSBAND;
         LocalDateTime from = window.from();
@@ -229,7 +238,7 @@ public class DashboardServiceImple implements DashboardService {
 
         List<Map<String, Object>> stages = new ArrayList<>();
         stages.add(buildStage("OPENER", "Opener", openerTaps, openerTaps));
-        stages.add(buildStage("FIND_HER_GIFT", "Find Her Gift",
+        stages.add(buildStage("FIND_HER_GIFT", "Find Her a Gift",
                 dashboardRepo.countSessionsWithButtonTap(TAP_HUSBAND_FIND_HER_GIFT, husband, from, to), openerTaps));
         stages.add(buildStage("CATEGORY", "Category",
                 dashboardRepo.countSessionsWithButtonTapPrefix(TAP_CATEGORY_PREFIX, husband, from, to), openerTaps));
@@ -237,10 +246,11 @@ public class DashboardServiceImple implements DashboardService {
                 dashboardRepo.countSessionsWithButtonTapPrefix(TAP_HUSBAND_BUDGET_PREFIX, husband, from, to), openerTaps));
         stages.add(buildStage("CAROUSEL", "Carousel",
                 dashboardRepo.countSessionsReachedStep(List.of(STEP_H_BROWSE_PRODUCTS), husband, from, to), openerTaps));
-        stages.add(buildStage("CHOSE_PIECE", "Chose a Piece",
-                dashboardRepo.countSessionsWithPickAction(SELECTED_ACTION, husband, from, to), openerTaps));
-        stages.add(buildStage("BUY_ONLINE", "Buy Online",
-                dashboardRepo.countSessionsWithLead(List.of(LEAD_BUY_ONLINE_CLICKED), husband, from, to), openerTaps));
+        stages.add(buildStage("BUY_OR_VISIT", "Buy / Visit",
+                dashboardRepo.countSessionsWithEitherButtonTapPrefix(TAP_HUSBAND_BUY_PREFIX, TAP_PRODUCT_VISIT_PREFIX,
+                        husband, from, to), openerTaps));
+        stages.add(buildStage("HER_DETAILS_ASK", "Her Details Ask",
+                dashboardRepo.countSessionsReachedStep(List.of(STEP_H_CAP_DETAILS), husband, from, to), openerTaps));
         stages.add(buildStage("HER_DETAILS", "Her Details",
                 dashboardRepo.countSessionsReachedStep(List.of(STEP_H_CONSENT), husband, from, to), openerTaps));
         stages.add(buildStage("CONSENT", "Consent",
@@ -344,14 +354,14 @@ public class DashboardServiceImple implements DashboardService {
     }
 
     private String activityBadge(DashboardRepository.ActivityRowProjection row) {
-        if ("PICK".equals(row.getSource())) {
+        if ("PICK".equals(row.getSource()) || "OPENER_TAP".equals(row.getSource())) {
             return "MSG";
         }
         return switch (row.getEventType()) {
             case LEAD_HUSBAND_CAPTURED, LEAD_WIFE_CAPTURED -> "REFERRAL";
             case LEAD_HINT_SENT -> "ISHARA";
             case LEAD_STORE_VISIT_BOOKED -> "VISIT";
-            case LEAD_BUY_ONLINE_CLICKED -> "BUY ONLINE";
+            case LEAD_BUY_ONLINE_CLICKED -> "BUY";
             case LEAD_SPARKLE_OPT_IN -> "OPT-IN";
             case LEAD_SPARKLE_OPT_OUT -> "OPT-OUT";
             default -> "LEAD";
@@ -361,6 +371,9 @@ public class DashboardServiceImple implements DashboardService {
     private String summarizeActivityRow(DashboardRepository.ActivityRowProjection row) {
         String customer = displayName(row.getCustomerName(), row.getPhone());
 
+        if ("OPENER_TAP".equals(row.getSource())) {
+            return customer + " tapped “" + openerButtonLabel(row.getPath()) + "”";
+        }
         if ("PICK".equals(row.getSource())) {
             String piece = hasText(row.getProductName()) ? row.getProductName() : row.getSku();
             return PICK_ADDED.equals(row.getEventType())
@@ -370,17 +383,53 @@ public class DashboardServiceImple implements DashboardService {
 
         String mobileText = hasText(row.getPartnerPhone()) ? " + mobile" : "";
         String consentText = consentText(row.getConsent());
-        String storeText = hasText(row.getStoreName()) ? " · " + row.getStoreName() : "";
+        String piece = hasText(row.getProductName()) ? row.getProductName() : row.getSku();
 
         return switch (row.getEventType()) {
             case LEAD_HUSBAND_CAPTURED -> customer + " referred her husband · anniversary" + mobileText + consentText;
             case LEAD_WIFE_CAPTURED -> customer + " referred his wife · birthday" + mobileText + consentText;
-            case LEAD_HINT_SENT -> customer + " created her Ishara for her husband";
-            case LEAD_STORE_VISIT_BOOKED -> customer + " booked a visit" + storeText;
-            case LEAD_BUY_ONLINE_CLICKED -> customer + " asked for the Buy Online link";
+            case LEAD_HINT_SENT -> customer + " sent her Ishara to her husband" + pieceCountText(row.getSku());
+            case LEAD_STORE_VISIT_BOOKED -> customer + " booked a visit" + visitText(row);
+            case LEAD_BUY_ONLINE_CLICKED -> customer + " tapped Buy Online" + (hasText(piece) ? " · " + piece : "");
             case LEAD_SPARKLE_OPT_IN -> customer + " asked to be kept posted";
             case LEAD_SPARKLE_OPT_OUT -> customer + " said no to updates";
             default -> customer + " · " + row.getEventType();
+        };
+    }
+
+    /** " (2 pieces)" from the Ishara's comma-separated SKUs. */
+    private String pieceCountText(String skus) {
+        if (!hasText(skus)) return "";
+        long pieces = Arrays.stream(skus.split(",")).filter(this::hasText).count();
+        return " (" + pieces + (pieces == 1 ? " piece)" : " pieces)");
+    }
+
+    /** " · Mia, Select Citywalk – Saket, Tomorrow 6:30 pm" — store, day and slot from the booking. */
+    private String visitText(DashboardRepository.ActivityRowProjection row) {
+        List<String> parts = new ArrayList<>();
+        if (hasText(row.getStoreName())) parts.add(row.getStoreName());
+        String when = (visitDayText(row.getVisitDate()) + " " + (row.getTimeSlot() == null ? "" : row.getTimeSlot())).trim();
+        if (!when.isEmpty()) parts.add(when);
+        return parts.isEmpty() ? "" : " · " + String.join(", ", parts);
+    }
+
+    /** Today / Tomorrow / "12 Oct". */
+    private String visitDayText(LocalDate visitDate) {
+        if (visitDate == null) return "";
+        LocalDate today = LocalDate.now();
+        if (visitDate.equals(today)) return "Today";
+        if (visitDate.equals(today.plusDays(1))) return "Tomorrow";
+        return visitDate.format(DAY_MONTH);
+    }
+
+    /** The Step 0 button she tapped, by the path it started. */
+    private String openerButtonLabel(String path) {
+        if (path == null) return "the opener";
+        return switch (path) {
+            case TEMPLATE_WIFE -> "I'm celebrating";
+            case TEMPLATE_HUSBAND -> "Shopping for her";
+            case TEMPLATE_SPARKLE -> "Here for the sparkle";
+            default -> path;
         };
     }
 
