@@ -2,6 +2,17 @@ package org.example.karvachauth.service;
 
 public interface BotEngineService {
 
+    /**
+     * Step 0 — the Karix template (sent from the Karix portal) reached her: called on its first
+     * delivery receipt. Saves the customer, a session on STEP_OPENER and the template message.
+     */
+    void recordOpenerTemplate(String phone, String mid, String templateId,
+                              String status, String errorCode, String errorReason);
+
+
+    void startFromOpener(String phone, String name, String path, String payload, String title);
+
+    /** /test only — same as startFromOpener without a real tap. */
     void startWifeFlow(String phone, String name);
 
     void startHusbandFlow(String phone, String name);

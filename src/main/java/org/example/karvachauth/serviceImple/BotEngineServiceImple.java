@@ -54,6 +54,12 @@ public class BotEngineServiceImple implements BotEngineService {
     private final LeadRepository leadRepository;                 // conversions → dashboard funnel
     private final ProductPickRepository productPickRepository;   // product interactions → "top products"
     private final TaskScheduler taskScheduler;   // needs @EnableScheduling on the application class
+
+    /**
+     * The last message recordOutbound() saved on this thread, for moveTo() to put on the new step.
+     * Cleared at the start of every tap / text / opener / follow-up, so it never leaks into the next one.
+     */
+    private final ThreadLocal<Message> lastOutbound = new ThreadLocal<>();
     // PRODUCTION: uncomment together with the queries in sendProductPage()
     // private final ProductRepository productRepository;
 
@@ -167,75 +173,178 @@ public class BotEngineServiceImple implements BotEngineService {
     }
 
 
+    // ==================================================================
+    // STEP 0 — OPENER
+    //
+    //   Karix template reaches her            → session on OPENER (no path yet)
+    //   she taps "I'm celebrating" / …        → path saved, "Choose my gift" / … sent — still OPENER
+    //   she taps "Choose my gift" / "Find her a gift" / "Show me"
+    //                                         → W_CHOOSE_MY_GIFT / H_FIND_HER_GIFT / S_SHOW_ME
+    //
+    // So until she taps the path's first button she shows as OPENER everywhere.
+    // ==================================================================
+
+    /**
+     * The Step 0 template — sent from the Karix portal, not by us, so we first see it when its first
+     * delivery receipt reaches the webhook. Saves the customer, a session on OPENER and the template
+     * message (on OPENER, linked to that session).
+     *
+     * No new session if the template FAILED (she never got it), or if she's in the middle of a journey —
+     * her current buttons must keep working; tapping the new template starts a fresh journey anyway.
+     */
+    @Override
+    public void recordOpenerTemplate(String phone, String mid, String templateId,
+                                     String status, String errorCode, String errorReason) {
+        String to = normalizePhone(phone);
+        if (to == null || mid == null) {
+            log.warn("recordOpenerTemplate: missing phone/mid");
+            return;
+        }
+        try {
+            Customer customer = findOrCreateCustomer(to);
+            boolean failed = MSG_STATUS_FAILED.equals(status);
+
+            Session session = null;
+            if (!failed) {
+                Optional<Session> active = sessionRepository.findFirstByPhoneAndIsActiveTrueOrderByIdDesc(to);
+                if (active.isEmpty()) {
+                    session = sessionRepository.save(Session.builder()
+                            .customerId(customer.getId())
+                            .phone(to)
+                            .currentStep(STEP_OPENER)            // path stays null until she taps
+                            .build());
+                    log.info("stage=OPENER_SESSION_CREATED sessionId={}", session.getId());
+                } else if (STEP_OPENER.equals(active.get().getCurrentStep()) && active.get().getPath() == null) {
+                    session = active.get();                      // an earlier template she never tapped
+                } else {
+                    log.info("stage=OPENER_TEMPLATE_MID_JOURNEY sessionId={} step={} — current journey kept",
+                            active.get().getId(), active.get().getCurrentStep());
+                }
+            }
+
+            messageRepository.save(Message.builder()
+                    .customerId(customer.getId())
+                    .sessionId(session == null ? null : session.getId())
+                    .phone(to)
+                    .direction(DIR_OUTBOUND)
+                    .karixMessageId(mid)
+                    .status(status)
+                    .step(STEP_OPENER)
+                    .messageType("template")
+                    .templateName(templateId)
+                    .errorCode(failed ? errorCode : null)
+                    .errorReason(failed && errorReason != null
+                            ? errorReason.substring(0, Math.min(errorReason.length(), 500)) : null)
+                    .statusUpdatedAt(LocalDateTime.now())
+                    .build());
+            log.info("stage=OPENER_TEMPLATE_RECORDED customerId={} sessionId={} template={} status={}",
+                    customer.getId(), session == null ? null : session.getId(), templateId, status);
+        } catch (Exception e) {
+            log.error("Failed to record the Step 0 template mid={}", mid, e);
+        }
+    }
+
+    /**
+     * She tapped a Step 0 button ("I'm celebrating" / "Shopping for her" / "Here for the sparkle").
+     *
+     *   1. Her OPENER session (made when the template arrived) gets the path. If there's none — or she's
+     *      already on a journey — the old one is closed and a new OPENER session is started.
+     *   2. Her tap is saved on OPENER, with the button's payload and text.
+     *   3. "Choose my gift" / "Find her a gift" / "Show me" is sent, also saved on OPENER.
+     *
+     * The session STAYS on OPENER — it moves to W_CHOOSE_MY_GIFT / H_FIND_HER_GIFT / S_SHOW_ME only
+     * when she taps that button (onButtonTap).
+     *
+     * payload = null when started from /test (no real tap) — then step 2 is skipped.
+     */
+    @Override
+    public void startFromOpener(String phone, String name, String path, String payload, String title) {
+        lastOutbound.remove();
+        String to = normalizePhone(phone);
+        if (to == null) {
+            log.warn("startFromOpener: invalid phone");
+            return;
+        }
+
+        String text;
+        List<String[]> buttons;
+        switch (path == null ? "" : path) {
+            case TEMPLATE_WIFE -> {
+                text = "How lovely! Choose a piece that feels like you - "
+                        + "we'll make sure he knows exactly what to gift you this Karwa Chauth.";
+                buttons = List.of(
+                        new String[]{"W_CHOOSE_MY_GIFT", "💛 Choose my gift"},
+                        new String[]{"BTN_STORE_FINDER", "Visit nearby store"});
+            }
+            case TEMPLATE_HUSBAND -> {
+                text = "Let's find her something she'll cherish. Shall we take a look together?";
+                buttons = List.of(
+                        new String[]{"H_FIND_HER_GIFT", "💛 Find her a gift"},
+                        new String[]{"BTN_STORE_FINDER", "Visit nearby store"});
+            }
+            case TEMPLATE_SPARKLE -> {
+                text = "Who needs an occasion anyway? Let's find something beautiful for you. ✨";
+                buttons = List.of(
+                        new String[]{"S_SHOW_ME", "✨ Show me"},
+                        new String[]{"BTN_STORE_FINDER", "Visit nearby store"});
+            }
+            default -> {
+                log.warn("startFromOpener: unknown path={}", path);
+                return;
+            }
+        }
+
+        Customer customer = getOrCreateCustomer(to, name, path);
+
+        // 1. Her OPENER session from the template receipt, or a fresh one
+        Optional<Session> active = sessionRepository.findFirstByPhoneAndIsActiveTrueOrderByIdDesc(to);
+        Session session;
+        if (active.isPresent() && STEP_OPENER.equals(active.get().getCurrentStep()) && active.get().getPath() == null) {
+            session = active.get();
+            session.setPath(path);
+            session.setLastInboundAt(LocalDateTime.now());
+            session.setIdleNudgeSent(false);
+            session = sessionRepository.save(session);
+            log.info("stage=OPENER_PATH_CHOSEN sessionId={} path={}", session.getId(), path);
+        } else {
+            session = startNewSession(customer, path, STEP_OPENER);   // closes any older session
+            linkOpenerTemplate(session);
+        }
+
+        // 2. Her Step 0 tap, on OPENER
+        if (payload != null && !payload.isBlank()) {
+            recordInbound(session, payload.trim(), title);
+        }
+
+        // 3. The path's first message, on OPENER — the session stays on OPENER until she taps it
+        String mid = karixService.sendButtonMessage(to, text, buttons);
+        recordOutbound(session, "interactive", text, mid);
+
+        log.info("stage=OPENER_ANSWERED sessionId={} path={} payload={} step={} sent={}",
+                session.getId(), path, payload, session.getCurrentStep(), mid != null);
+    }
+
+    /** /test only — starts the Wife journey as if Step 0 was tapped (there's no real tap to save). */
     @Override
     public void startWifeFlow(String phone, String name) {
-        String to = normalizePhone(phone);
-        if (to == null) {
-            log.warn("startWifeFlow: invalid phone");
-            return;
-        }
-
-        Customer customer = getOrCreateCustomer(to, name, TEMPLATE_WIFE);
-        Session session = startNewSession(customer, TEMPLATE_WIFE, STEP_W_OPENER);
-
-        String text = "How lovely! Choose a piece that feels like you - "
-                + "we'll make sure he knows exactly what to gift you this Karwa Chauth.";
-
-        String mid = karixService.sendButtonMessage(to, text,
-                List.of(
-                        new String[]{"W_CHOOSE_MY_GIFT", "💛 Choose my gift"},
-                        new String[]{"BTN_STORE_FINDER", "Visit nearby store"}));
-
-        recordOutbound(session, "interactive", text, mid);
-        log.info("Wife opener sent sessionId={} sent={}", session.getId(), mid != null);
+        startFromOpener(phone, name, TEMPLATE_WIFE, null, null);
     }
 
+    /** /test only — starts the Husband journey as if Step 0 was tapped. */
     @Override
     public void startHusbandFlow(String phone, String name) {
-        String to = normalizePhone(phone);
-        if (to == null) {
-            log.warn("startHusbandFlow: invalid phone");
-            return;
-        }
-
-        Customer customer = getOrCreateCustomer(to, name, TEMPLATE_HUSBAND);
-        Session session = startNewSession(customer, TEMPLATE_HUSBAND, STEP_H_OPENER);
-
-        String text = "Let's find her something she'll cherish. Shall we take a look together?";
-
-        String mid = karixService.sendButtonMessage(to, text,
-                List.of(
-                        new String[]{"H_FIND_HER_GIFT", "💛 Find her a gift"},
-                        new String[]{"BTN_STORE_FINDER", "Visit nearby store"}));
-
-        recordOutbound(session, "interactive", text, mid);
-        log.info("Husband opener sent sessionId={} sent={}", session.getId(), mid != null);
+        startFromOpener(phone, name, TEMPLATE_HUSBAND, null, null);
     }
 
+    /** /test only — starts the Sparkle journey as if Step 0 was tapped. */
     @Override
     public void startSparkleFlow(String phone, String name) {
-        String to = normalizePhone(phone);
-        if (to == null) {
-            log.warn("startSparkleFlow: invalid phone");
-            return;
-        }
-
-        Customer customer = getOrCreateCustomer(to, name, TEMPLATE_SPARKLE);
-        Session session = startNewSession(customer, TEMPLATE_SPARKLE, STEP_S_OPENER);
-
-        String text = "Who needs an occasion anyway? Let's find something beautiful for you. ✨";
-
-        String mid = karixService.sendButtonMessage(to, text,
-                List.of(
-                        new String[]{"S_SHOW_ME", "✨ Show me"},
-                        new String[]{"BTN_STORE_FINDER", "Visit nearby store"}));
-
-        recordOutbound(session, "interactive", text, mid);
-        log.info("Sparkle opener sent sessionId={} sent={}", session.getId(), mid != null);
+        startFromOpener(phone, name, TEMPLATE_SPARKLE, null, null);
     }
 
     @Override
     public boolean onButtonTap(String phone, String path, String payload) {
+        lastOutbound.remove();
         String to = normalizePhone(phone);
         if (to == null || payload == null || payload.isBlank()) {
             log.warn("onButtonTap: missing phone/payload");
@@ -255,12 +364,27 @@ public class BotEngineServiceImple implements BotEngineService {
             log.warn("stage=PATH_MISMATCH requested={} session={} — using the session's path", path, session.getPath());
         }
 
+        // Taps that ARE a step ("Choose my gift", a category …) move the session to that step first,
+        // so the tap and our reply to it are both saved on it. Every other tap is saved on the step she was on.
+        String tapStep = stepForTap(session.getPath(), p);
+        if (tapStep != null) {
+            session.setCurrentStep(tapStep);
+        }
+
         // Record the tap (original payload, with suffix) and reset the idle timer
         recordInbound(session, payload.trim());
         session.setLastInboundAt(LocalDateTime.now());
         session.setIdleNudgeSent(false);
         log.info("stage=BUTTON_TAP sessionId={} path={} step={} payload={}",
                 session.getId(), session.getPath(), session.getCurrentStep(), p);
+
+        // Still on the Step 0 template with no path picked (e.g. she tapped a button from an old,
+        // finished journey) — nothing to route to until she taps one of the template's buttons
+        if (session.getPath() == null) {
+            log.warn("stage=NO_PATH_YET sessionId={} payload={} — waiting for a Step 0 tap", session.getId(), p);
+            sessionRepository.save(session);
+            return false;
+        }
 
         boolean handled = false;
 
@@ -293,7 +417,8 @@ public class BotEngineServiceImple implements BotEngineService {
         } else {
             switch (session.getPath()) {
                 case TEMPLATE_WIFE -> {
-                    if ("W_CHOOSE_MY_GIFT".equals(p))  handled = wifePickCategory(session);
+                    // 1 — "Choose my gift": OPENER → W_CHOOSE_MY_GIFT (categories shown)
+                    if ("W_CHOOSE_MY_GIFT".equals(p))  handled = wifePickCategory(session, STEP_W_CHOOSE_MY_GIFT);
                     else if (p.startsWith("CAT_"))     handled = wifeBrowseProducts(session, p.substring(4));
                     else if (p.startsWith("ADD_"))     handled = addToList(session, p.substring(4));
                     else if ("W_SEND_ISHARA".equals(p)) handled = sendIshara(session);
@@ -310,7 +435,8 @@ public class BotEngineServiceImple implements BotEngineService {
                     else if ("W_CONSENT_NO".equals(p))  handled = onHusbandConsent(session, false);
                 }
                 case TEMPLATE_HUSBAND -> {
-                    if ("H_FIND_HER_GIFT".equals(p))   handled = husbandPickCategory(session);
+                    // 2 — "Find her a gift": OPENER → H_FIND_HER_GIFT (categories shown)
+                    if ("H_FIND_HER_GIFT".equals(p))   handled = husbandPickCategory(session, STEP_H_FIND_HER_GIFT);
                     else if (p.startsWith("CAT_"))     handled = husbandChooseBudget(session, p.substring(4));    // 2A → 2A-Budget
                     else if (p.startsWith("H_BUDGET_")) handled = husbandBrowseProducts(session, p.substring(9)); // 2A-Budget → 2B
                     else if (p.startsWith("BUY_"))      handled = husbandConfirmChoice(session, p.substring(4));  // 2B → 2C
@@ -321,7 +447,8 @@ public class BotEngineServiceImple implements BotEngineService {
                     else if ("H_CONSENT_NO".equals(p))  handled = onWifeConsent(session, false);                 // 2G → E1
                 }
                 case TEMPLATE_SPARKLE -> {
-                    if ("S_SHOW_ME".equals(p))         handled = sparklePickCategory(session);
+                    // 1-Sparkle — "Show me": OPENER → S_SHOW_ME (categories shown)
+                    if ("S_SHOW_ME".equals(p))         handled = sparklePickCategory(session, STEP_S_SHOW_ME);
                     else if (p.startsWith("CAT_"))      handled = sparkleChooseBudget(session, p.substring(4));    // 1A → 1A-Budget
                     else if (p.startsWith("S_BUDGET_")) handled = sparkleBrowseProducts(session, p.substring(9));  // 1A-Budget → 1B
                     else if (p.startsWith("ADD_"))     handled = addToList(session, p.substring(4));   // ready for when Sparkle 1B is built
@@ -339,6 +466,29 @@ public class BotEngineServiceImple implements BotEngineService {
         // Save step (if it moved), category, lastInboundAt, idleNudgeSent
         sessionRepository.save(session);
         return handled;
+    }
+
+    /**
+     * The step a tap itself stands for, or null if the tap is just an answer on the current step.
+     *
+     *   "Choose my gift" / "Find her a gift" / "Show me"  → W_CHOOSE_MY_GIFT / H_FIND_HER_GIFT / S_SHOW_ME
+     *   a category ("Browse these", CAT_*)                → W_PICK_CATEGORY / H_PICK_CATEGORY / S_PICK_CATEGORY
+     *
+     * The reply then moves the session on (products → W_BROWSE_PRODUCTS, budget list → H_BUDGET / S_BUDGET),
+     * but the tap and the reply stay saved on the step she chose.
+     */
+    private static String stepForTap(String path, String p) {
+        if (path == null) return null;
+        boolean category = p.startsWith("CAT_");
+        return switch (path) {
+            case TEMPLATE_WIFE    -> "W_CHOOSE_MY_GIFT".equals(p) ? STEP_W_CHOOSE_MY_GIFT
+                    : category ? STEP_W_PICK_CATEGORY : null;
+            case TEMPLATE_HUSBAND -> "H_FIND_HER_GIFT".equals(p) ? STEP_H_FIND_HER_GIFT
+                    : category ? STEP_H_PICK_CATEGORY : null;
+            case TEMPLATE_SPARKLE -> "S_SHOW_ME".equals(p) ? STEP_S_SHOW_ME
+                    : category ? STEP_S_PICK_CATEGORY : null;
+            default -> null;
+        };
     }
 
     // ==================================================================
@@ -372,6 +522,7 @@ public class BotEngineServiceImple implements BotEngineService {
      */
     @Override
     public boolean onTextMessage(String phone, String text) {
+        lastOutbound.remove();
         String to = normalizePhone(phone);
         if (to == null || text == null || text.isBlank()) {
             log.warn("onTextMessage: missing phone/text");
@@ -416,22 +567,40 @@ public class BotEngineServiceImple implements BotEngineService {
 
     /** Step 1A (Wife) — 7 categories incl. Mia Sutra. */
     private boolean wifePickCategory(Session session) {
+        return wifePickCategory(session, STEP_W_PICK_CATEGORY);
+    }
+
+    /**
+     * step = W_CHOOSE_MY_GIFT when she's just tapped "Choose my gift" (first time she sees the categories),
+     * W_PICK_CATEGORY when she comes back to them later ("Another category", idle nudge).
+     */
+    private boolean wifePickCategory(Session session, String step) {
         String text = "Beautiful. Pick a category you’re drawn to – "
                 + "I’ll help you put together something to share with him.";
-        return sendCategoryCarousel(session, text, true, STEP_W_PICK_CATEGORY);
+        return sendCategoryCarousel(session, text, true, step);
     }
 
     /** Step 2A (Husband) — same 7 categories, he browses on her behalf. */
     private boolean husbandPickCategory(Session session) {
+        return husbandPickCategory(session, STEP_H_PICK_CATEGORY);
+    }
+
+    /** step = H_FIND_HER_GIFT right after "Find her a gift", H_PICK_CATEGORY when she comes back later. */
+    private boolean husbandPickCategory(Session session, String step) {
         String text = "Love that. Let's find her something she'll adore. ✨";
-        return sendCategoryCarousel(session, text, true, STEP_H_PICK_CATEGORY);
+        return sendCategoryCarousel(session, text, true, step);
     }
 
     /** Step 1A (Sparkle) — 6 categories, Mia Sutra excluded (not necessarily married). */
     private boolean sparklePickCategory(Session session) {
+        return sparklePickCategory(session, STEP_S_PICK_CATEGORY);
+    }
+
+    /** step = S_SHOW_ME right after "Show me", S_PICK_CATEGORY when she comes back later. */
+    private boolean sparklePickCategory(Session session, String step) {
         String text = "Wonderful! Pick a category you’re drawn to – "
                 + "let’s put together something that’s entirely yours.";
-        return sendCategoryCarousel(session, text, false, STEP_S_PICK_CATEGORY);
+        return sendCategoryCarousel(session, text, false, step);
     }
 
     // ==================================================================
@@ -484,7 +653,7 @@ public class BotEngineServiceImple implements BotEngineService {
             log.warn("stage=BUDGET_LIST_FAILED sessionId={} path={} — step not changed", session.getId(), session.getPath());
             return false;
         }
-        session.setCurrentStep(nextStep);
+        moveTo(session, nextStep);
         log.info("stage=BUDGET_LIST_SENT sessionId={} path={} category={}", session.getId(), session.getPath(), category);
         return true;
     }
@@ -548,7 +717,7 @@ public class BotEngineServiceImple implements BotEngineService {
                     session.getId(), session.getPath(), cards.size());
             return false;
         }
-        session.setCurrentStep(nextStep);
+        moveTo(session, nextStep);
         log.info("stage=CATEGORY_CAROUSEL_SENT sessionId={} path={} step={} cards={} mid={}",
                 session.getId(), session.getPath(), nextStep, cards.size(), mid);
         return true;
@@ -672,7 +841,7 @@ public class BotEngineServiceImple implements BotEngineService {
                     session.getId(), category, page);
             return false;
         }
-        session.setCurrentStep(nextStep);
+        moveTo(session, nextStep);
         log.info("stage=PRODUCT_CAROUSEL_SENT sessionId={} category={} budget={} inBudget={} toppedUp={} page={} cards={} hasMore={}",
                 session.getId(), category, session.getSelectedBudget(), inBudgetCount, budgetFallback, page, cards.size(), hasMore);
 
@@ -825,7 +994,7 @@ public class BotEngineServiceImple implements BotEngineService {
             log.warn("stage=ADDED_TO_LIST_MSG_FAILED sessionId={} — step not changed", session.getId());
             return false;
         }
-        session.setCurrentStep(nextStep);
+        moveTo(session, nextStep);
         return true;
     }
 
@@ -921,7 +1090,7 @@ public class BotEngineServiceImple implements BotEngineService {
             log.warn("stage=ISHARA_FAILED sessionId={} — step not changed", session.getId());
             return false;
         }
-        session.setCurrentStep(STEP_W_HINT_READY);
+        moveTo(session, STEP_W_HINT_READY);
         log.info("stage=ISHARA_SENT sessionId={} items={} shown={}", session.getId(), items.size(), shown);
 
         // Primary objective reached — record the conversion and which pieces were in the hint
@@ -952,6 +1121,7 @@ public class BotEngineServiceImple implements BotEngineService {
     private void scheduleFollowUp(Long sessionId, String expectedStep, long delaySeconds,
                                   String label, Predicate<Session> sender) {
         taskScheduler.schedule(() -> {
+            lastOutbound.remove();
             try {
                 Session latest = sessionRepository.findById(sessionId).orElse(null);
                 if (latest == null
@@ -985,7 +1155,7 @@ public class BotEngineServiceImple implements BotEngineService {
             log.warn("stage=STORE_INVITE_MSG_FAILED sessionId={}", session.getId());
             return false;
         }
-        session.setCurrentStep(STEP_W_STORE_INVITE);
+        moveTo(session, STEP_W_STORE_INVITE);
         log.info("stage=STORE_INVITE_SENT sessionId={}", session.getId());
         return true;
     }
@@ -1024,7 +1194,7 @@ public class BotEngineServiceImple implements BotEngineService {
             log.warn("stage=REINFORCE_FAILED sessionId={}", session.getId());
             return false;
         }
-        session.setCurrentStep(STEP_W_REINFORCE);
+        moveTo(session, STEP_W_REINFORCE);
         log.info("stage=REINFORCE_SENT sessionId={} path={}", session.getId(), session.getPath());
         return true;
     }
@@ -1044,7 +1214,7 @@ public class BotEngineServiceImple implements BotEngineService {
             log.warn("stage=REINFORCE_NUDGE_FAILED sessionId={}", session.getId());
             return false;
         }
-        session.setCurrentStep(STEP_W_REINFORCE_NUDGE);
+        moveTo(session, STEP_W_REINFORCE_NUDGE);
         log.info("stage=REINFORCE_NUDGE_SENT sessionId={}", session.getId());
         return true;
     }
@@ -1063,7 +1233,7 @@ public class BotEngineServiceImple implements BotEngineService {
             log.warn("stage=ASK_HUSBAND_NAME_FAILED sessionId={}", session.getId());
             return false;
         }
-        session.setCurrentStep(STEP_W_CAPH_NAME);
+        moveTo(session, STEP_W_CAPH_NAME);
         log.info("stage=ASK_HUSBAND_NAME sessionId={}", session.getId());
         return true;
     }
@@ -1082,7 +1252,7 @@ public class BotEngineServiceImple implements BotEngineService {
             log.warn("stage=SPARKLE_REINFORCE_FAILED sessionId={}", session.getId());
             return false;
         }
-        session.setCurrentStep(STEP_S_REINFORCE);
+        moveTo(session, STEP_S_REINFORCE);
         return true;
     }
 
@@ -1127,7 +1297,7 @@ public class BotEngineServiceImple implements BotEngineService {
             log.warn("stage=CLOSE_FAILED sessionId={} — session left open", session.getId());
             return false;
         }
-        session.setCurrentStep(STEP_CLOSED);
+        moveTo(session, STEP_CLOSED);
         session.setIsActive(false);
         session.setClosedAt(LocalDateTime.now());
         log.info("stage=JOURNEY_CLOSED sessionId={} path={} consent={}",
@@ -1148,8 +1318,8 @@ public class BotEngineServiceImple implements BotEngineService {
         }
         session.setPartnerName(name);
 
-        if (!askQuestion(session, "And your wedding anniversary? (e.g. 14 02 2015)")) return false;
-        session.setCurrentStep(STEP_W_CAPH_ANNIVERSARY);
+        if (!askQuestion(session, "And your wedding anniversary? (DD/MM/YYYY)")) return false;
+        moveTo(session, STEP_W_CAPH_ANNIVERSARY);
         log.info("stage=CAPTURED_HUSBAND_NAME sessionId={}", session.getId());
         return true;
     }
@@ -1158,12 +1328,12 @@ public class BotEngineServiceImple implements BotEngineService {
     private boolean onAnniversary(Session session, String answer) {
         LocalDate date = parsePastDate(answer);
         if (date == null) {
-            return reask(session, "Hmm, I couldn't read that date. Could you send day, month and year? e.g. *14 02 2015*");
+            return reask(session, "Hmm, I couldn't read that date. Could you send day, month and year? e.g. (DD/MM/YYYY)");
         }
         session.setPartnerDate(date);
 
         if (!askQuestion(session, "Lastly, his mobile number 📱")) return false;
-        session.setCurrentStep(STEP_W_CAPH_MOBILE);
+        moveTo(session, STEP_W_CAPH_MOBILE);
         log.info("stage=CAPTURED_ANNIVERSARY sessionId={}", session.getId());
         return true;
     }
@@ -1199,7 +1369,7 @@ public class BotEngineServiceImple implements BotEngineService {
             return false;
         }
         session.setConsent(CONSENT_PENDING);
-        session.setCurrentStep(STEP_W_CONSENT);
+        moveTo(session, STEP_W_CONSENT);
         return true;
     }
 
@@ -1326,7 +1496,7 @@ public class BotEngineServiceImple implements BotEngineService {
             log.warn("stage=CONFIRM_CHOICE_FAILED sessionId={} — step not changed", session.getId());
             return false;
         }
-        session.setCurrentStep(STEP_H_CONFIRM_CHOICE);
+        moveTo(session, STEP_H_CONFIRM_CHOICE);
         log.info("stage=CONFIRM_CHOICE_SENT sessionId={} sku={}", session.getId(), sku);
         return true;
     }
@@ -1381,7 +1551,7 @@ public class BotEngineServiceImple implements BotEngineService {
             log.warn("stage=HER_DETAILS_ASK_FAILED sessionId={}", session.getId());
             return false;
         }
-        session.setCurrentStep(STEP_H_CAP_DETAILS);
+        moveTo(session, STEP_H_CAP_DETAILS);
         log.info("stage=HER_DETAILS_ASK_SENT sessionId={}", session.getId());
         return true;
     }
@@ -1395,7 +1565,7 @@ public class BotEngineServiceImple implements BotEngineService {
     /** 2F Q1 — "💍 Add her details" tapped on 2E. */
     private boolean askWifeName(Session session) {
         if (!askQuestion(session, "What's her name?")) return false;
-        session.setCurrentStep(STEP_H_CAPW_NAME);
+        moveTo(session, STEP_H_CAPW_NAME);
         log.info("stage=ASK_WIFE_NAME sessionId={}", session.getId());
         return true;
     }
@@ -1408,8 +1578,8 @@ public class BotEngineServiceImple implements BotEngineService {
         }
         session.setPartnerName(name);
 
-        if (!askQuestion(session, "And her birthday? (e.g. 21 06 1992)")) return false;
-        session.setCurrentStep(STEP_H_CAPW_BIRTHDAY);
+        if (!askQuestion(session, "And her birthday? (DD/MM/YYYY)")) return false;
+        moveTo(session, STEP_H_CAPW_BIRTHDAY);
         log.info("stage=CAPTURED_WIFE_NAME sessionId={}", session.getId());
         return true;
     }
@@ -1418,12 +1588,12 @@ public class BotEngineServiceImple implements BotEngineService {
     private boolean onWifeBirthday(Session session, String answer) {
         LocalDate date = parsePastDate(answer);
         if (date == null) {
-            return reask(session, "Hmm, I couldn't read that date. Could you send day, month and year? e.g. *21 06 1992*");
+            return reask(session, "Hmm, I couldn't read that date. Could you send day, month and year?(DD/MM/YYYY)");
         }
         session.setPartnerDate(date);
 
         if (!askQuestion(session, "Lastly, her mobile number 📱")) return false;
-        session.setCurrentStep(STEP_H_CAPW_MOBILE);
+        moveTo(session, STEP_H_CAPW_MOBILE);
         log.info("stage=CAPTURED_WIFE_BIRTHDAY sessionId={}", session.getId());
         return true;
     }
@@ -1459,7 +1629,7 @@ public class BotEngineServiceImple implements BotEngineService {
             return false;
         }
         session.setConsent(CONSENT_PENDING);
-        session.setCurrentStep(STEP_H_CONSENT);
+        moveTo(session, STEP_H_CONSENT);
         return true;
     }
 
@@ -1517,6 +1687,7 @@ public class BotEngineServiceImple implements BotEngineService {
 
         log.info("stage=IDLE_RUN found={} idleMinutes={}", idle.size(), idleMinutes);
         for (Session session : idle) {
+            lastOutbound.remove();
             try {
                 if (sendIdleNudge(session)) {
                     session.setIdleNudgeSent(true);   // lastInboundAt is NOT touched — only her replies move it
@@ -1662,6 +1833,39 @@ public class BotEngineServiceImple implements BotEngineService {
         return customerRepository.save(customer);
     }
 
+    /**
+     * Step 0 template receipt: finds the customer by phone or creates a bare one (no name / path yet —
+     * both are filled in when she taps). An existing customer is left untouched.
+     */
+    private Customer findOrCreateCustomer(String phone) {
+        Optional<Customer> existing = customerRepository.findByPhone(phone);
+        if (existing.isPresent()) return existing.get();
+        try {
+            return customerRepository.save(Customer.builder().phone(phone).build());
+        } catch (DataIntegrityViolationException e) {
+            // Created a moment ago by another thread (phone is unique) — use that one
+            return customerRepository.findByPhone(phone).orElseThrow(() -> e);
+        }
+    }
+
+    /**
+     * Links her latest Step 0 template message (saved when its receipt came in, before any session
+     * existed) to the session her tap just started — so the session's messages begin at Step 0.
+     */
+    private void linkOpenerTemplate(Session session) {
+        try {
+            messageRepository.findFirstByPhoneAndMessageTypeAndSessionIdIsNullOrderByIdDesc(session.getPhone(), "template")
+                    .ifPresent(template -> {
+                        template.setSessionId(session.getId());
+                        if (template.getCustomerId() == null) template.setCustomerId(session.getCustomerId());
+                        if (template.getStep() == null) template.setStep(STEP_OPENER);
+                        messageRepository.save(template);
+                    });
+        } catch (Exception e) {
+            log.error("Failed to link the Step 0 template sessionId={}", session.getId(), e);   // never break the flow
+        }
+    }
+
     /** Tapping a Step 0 button always starts a fresh journey: close the old session, open a new one. */
     private Session startNewSession(Customer customer, String path, String firstStep) {
         sessionRepository.findFirstByPhoneAndIsActiveTrueOrderByIdDesc(customer.getPhone()).ifPresent(old -> {
@@ -1740,6 +1944,11 @@ public class BotEngineServiceImple implements BotEngineService {
     }
 
     private void recordInbound(Session session, String payload) {
+        recordInbound(session, payload, null);
+    }
+
+    /** A button tap, saved on the step she was on. title = the button's visible text, if we have it. */
+    private void recordInbound(Session session, String payload, String title) {
         try {
             messageRepository.save(Message.builder()
                     .customerId(session.getCustomerId())
@@ -1751,6 +1960,7 @@ public class BotEngineServiceImple implements BotEngineService {
                     .path(session.getPath())
                     .messageType("button")
                     .buttonPayload(payload)
+                    .buttonTitle(title == null ? null : title.substring(0, Math.min(title.length(), 100)))
                     .build());
         } catch (Exception e) {
             log.error("Failed to record inbound message sessionId={}", session.getId(), e);
@@ -1775,10 +1985,13 @@ public class BotEngineServiceImple implements BotEngineService {
         }
     }
 
-    /** Status starts as SENT, or FAILED if Karix rejected it. */
+    /**
+     * Our message, saved on the step the session is on now. Status starts as SENT, or FAILED if Karix
+     * rejected it. If the reply then moves the session on, moveTo() re-saves it on the new step.
+     */
     private void recordOutbound(Session session, String messageType, String text, String mid) {
         try {
-            messageRepository.save(Message.builder()
+            Message saved = messageRepository.save(Message.builder()
                     .customerId(session.getCustomerId())
                     .sessionId(session.getId())
                     .phone(session.getPhone())
@@ -1791,8 +2004,27 @@ public class BotEngineServiceImple implements BotEngineService {
                     .contentText(text)
                     .errorReason(mid == null ? "Karix send failed — see 'Karix API response' log" : null)
                     .build());
+            lastOutbound.set(saved);
         } catch (Exception e) {
             log.error("Failed to record outbound message sessionId={}", session.getId(), e);
+        }
+    }
+
+    /**
+     * Moves the session to its next step AND saves the message we just sent on that step — so a message
+     * is stored on the step it puts her on: the Pendants carousel on W_BROWSE_PRODUCTS, the
+     * "Happy Karwa Chauth" goodbye on CLOSED, the "What's your husband's name?" on W_CAPH_NAME, …
+     */
+    private void moveTo(Session session, String step) {
+        session.setCurrentStep(step);
+        Message last = lastOutbound.get();
+        lastOutbound.remove();
+        if (last == null || !session.getId().equals(last.getSessionId())) return;
+        try {
+            last.setStep(step);
+            messageRepository.save(last);
+        } catch (Exception e) {
+            log.error("Failed to re-save message step sessionId={} step={}", session.getId(), step, e);
         }
     }
 

@@ -15,10 +15,15 @@ public final class KarvaChauthConstants {
     public static final String DIR_INBOUND  = "INBOUND";
     public static final String DIR_OUTBOUND = "OUTBOUND";
 
+    //    =========================STEP 0 — OPENER (shared)=================================================
+    // Session starts here when the Karix template reaches her (webhook receipt), and STAYS here after she
+    // picks her path and we send "Choose my gift" / "Find her a gift" / "Show me" — until she taps that button.
+    public static final String STEP_OPENER                = "OPENER";           //0
+
 //    =========================WIFE_JOURNEY=======================================================
 
-    public static final String STEP_W_OPENER              = "W_OPENER";         //1
-    public static final String STEP_W_PICK_CATEGORY       = "W_PICK_CATEGORY";  //1A
+    public static final String STEP_W_CHOOSE_MY_GIFT      = "W_CHOOSE_MY_GIFT"; //1   tapped "💛 Choose my gift" → categories shown
+    public static final String STEP_W_PICK_CATEGORY       = "W_PICK_CATEGORY";  //1A  categories shown again ("Another category" / idle nudge)
     public static final String STEP_W_BUDGET              = "W_BUDGET";          //1A
     public static final String STEP_W_BROWSE_PRODUCTS     = "W_BROWSE_PRODUCTS";         //1B
     public static final String STEP_W_ADDED_TO_LIST       = "W_ADDED_TO_LIST";   //1C
@@ -36,7 +41,7 @@ public final class KarvaChauthConstants {
 
 
     //===============================HUSBAND JOURNEY======================================================
-    public static final String STEP_H_OPENER              = "H_OPENER";         //2
+    public static final String STEP_H_FIND_HER_GIFT       = "H_FIND_HER_GIFT";  //2   tapped "💛 Find her a gift" → categories shown
     public static final String STEP_H_PICK_CATEGORY       = "H_PICK_CATEGORY";  //2A
     public static final String STEP_H_BUDGET              = "H_BUDGET";          //2A-BUDGET
     public static final String STEP_H_BROWSE_PRODUCTS     = "H_BROWSE_PRODUCTS";   //2B
@@ -50,7 +55,7 @@ public final class KarvaChauthConstants {
 
     //    =========================SPARKLE_JOURNEY=======================================================
 
-    public static final String STEP_S_OPENER              = "S_OPENER";          //1-Sparkle
+    public static final String STEP_S_SHOW_ME             = "S_SHOW_ME";         //1-Sparkle tapped "✨ Show me" → categories shown
     public static final String STEP_S_PICK_CATEGORY       = "S_PICK_CATEGORY";   //1A (6 categories, no Mia Sutra)
     public static final String STEP_S_BUDGET              = "S_BUDGET";          //1A-BUDGET
     public static final String STEP_S_BROWSE_PRODUCTS     = "S_BROWSE_PRODUCTS"; //1B
