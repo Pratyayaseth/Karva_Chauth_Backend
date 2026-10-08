@@ -541,10 +541,9 @@ public class DashboardServiceImple implements DashboardService {
             CAT_BRACELETS_BANGLES, "Bracelets & Bangles");
 
     private static final Map<String, String> BUDGET_LABELS = orderedMap(
-            BUDGET_UNDER_50K, "Under ₹50,000",
-            BUDGET_50_100K, "₹50,000 – ₹1,00,000",
-            BUDGET_100_200K, "₹1,00,000 – ₹2,00,000",
-            BUDGET_ABOVE_200K, "Above ₹2,00,000");
+            BUDGET_UNDER_20K, "Less than ₹20,000",
+            BUDGET_20_50K, "₹20,000 – ₹50,000",
+            BUDGET_ABOVE_50K, "Above ₹50,000");
 
     /**
      * The flow script's step codes — the same codes as the frontend's Step filter and the

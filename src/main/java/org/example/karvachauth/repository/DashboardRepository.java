@@ -402,7 +402,7 @@ public interface DashboardRepository extends JpaRepository<Lead, Long> {
                     "                      'H_CAPW_NAME', 'H_CAPW_BIRTHDAY', 'H_CAPW_MOBILE', " +
                     "                      'W_CONSENT', 'H_CONSENT', 'CLOSED'), 3, '0') " +
                     "  WHEN 'category' THEN conversation.category " +
-                    "  WHEN 'budget'   THEN LPAD(FIELD(conversation.budget, 'UNDER_50K', '50_100K', '100_200K', 'ABOVE_200K'), 3, '0') " +
+                    "  WHEN 'budget'   THEN LPAD(FIELD(conversation.budget, 'UNDER_20K', '20_50K', 'ABOVE_50K'), 3, '0') " +
                     "  ELSE DATE_FORMAT(conversation.lastActivity, '%Y%m%d%H%i%s') " +
                     "END";
 

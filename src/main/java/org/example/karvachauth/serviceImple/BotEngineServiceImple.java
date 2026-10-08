@@ -582,7 +582,7 @@ public class BotEngineServiceImple implements BotEngineService {
         return sendBudgetList(session, code, "H_BUDGET_", STEP_H_BUDGET);
     }
 
-    /** Saves the chosen category and sends the 4 budget bands as a list message. */
+    /** Saves the chosen category and sends the 3 budget bands as a list message. */
     private boolean sendBudgetList(Session session, String code, String payloadPrefix, String nextStep) {
         String category = categoryFromCode(code);
         if (category == null) {
@@ -597,10 +597,9 @@ public class BotEngineServiceImple implements BotEngineService {
 
         String mid = karixService.sendListMessage(session.getPhone(), text, "Choose budget",
                 List.of(
-                        new String[]{payloadPrefix + BUDGET_UNDER_50K,  "💫 Under ₹50,000"},
-                        new String[]{payloadPrefix + BUDGET_50_100K,    "💎 ₹50,000 – ₹1,00,000"},
-                        new String[]{payloadPrefix + BUDGET_100_200K,   "👑 ₹1,00,000 – ₹2,00,000"},
-                        new String[]{payloadPrefix + BUDGET_ABOVE_200K, "🏆 Above ₹2,00,000"}));
+                        new String[]{payloadPrefix + BUDGET_UNDER_20K, "💫 Less than 20,000"},
+                        new String[]{payloadPrefix + BUDGET_20_50K,    "💎 20,000 - 50,000"},
+                        new String[]{payloadPrefix + BUDGET_ABOVE_50K, "👑 Above 50,000"}));
         recordOutbound(session, "list", text, mid);
 
         if (mid == null) {
@@ -1766,15 +1765,14 @@ public class BotEngineServiceImple implements BotEngineService {
 
     /**
      * Budget band → {min, max} price in rupees. Null for no budget (Wife path) or an unknown band.
-     * Boundary prices (₹50,000, ₹1,00,000, ₹2,00,000) sit in the LOWER band — confirm with the Mia team.
+     * Script v7.2: "Less than 20,000" excludes ₹20,000; ₹50,000 itself sits in "20,000 - 50,000" — confirm with the Mia team.
      */
     private static int[] priceRange(String budget) {
         if (budget == null) return null;
         return switch (budget) {
-            case BUDGET_UNDER_50K  -> new int[]{0, 49_999};
-            case BUDGET_50_100K    -> new int[]{50_000, 100_000};
-            case BUDGET_100_200K   -> new int[]{100_001, 200_000};
-            case BUDGET_ABOVE_200K -> new int[]{200_001, Integer.MAX_VALUE};
+            case BUDGET_UNDER_20K -> new int[]{0, 19_999};
+            case BUDGET_20_50K    -> new int[]{20_000, 50_000};
+            case BUDGET_ABOVE_50K -> new int[]{50_001, Integer.MAX_VALUE};
             default -> null;
         };
     }

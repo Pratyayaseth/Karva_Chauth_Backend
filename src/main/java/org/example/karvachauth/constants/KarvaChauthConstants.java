@@ -68,11 +68,10 @@ public final class KarvaChauthConstants {
     public static final String STEP_BOOK_STORE_VISIT    = "BOOK_STORE_VISIT"; // C2 — Book a store visit (WhatsApp Flow). The only store step in v7.1 — there is no C1.
     public static final String STEP_CLOSED              = "CLOSED";             // E1
 
-    // BUDGET BANDS
-    public static final String BUDGET_UNDER_50K = "UNDER_50K";
-    public static final String BUDGET_50_100K = "50_100K";
-    public static final String BUDGET_100_200K = "100_200K";
-    public static final String BUDGET_ABOVE_200K = "ABOVE_200K";
+    // BUDGET BANDS (script v7.2)
+    public static final String BUDGET_UNDER_20K  = "UNDER_20K";   // 💫 Less than 20,000
+    public static final String BUDGET_20_50K     = "20_50K";      // 💎 20,000 - 50,000
+    public static final String BUDGET_ABOVE_50K  = "ABOVE_50K";   // 👑 Above 50,000
 
     // ===================== CATEGORIES =====================
     public static final String CAT_PENDANTS         = "PENDANTS";
