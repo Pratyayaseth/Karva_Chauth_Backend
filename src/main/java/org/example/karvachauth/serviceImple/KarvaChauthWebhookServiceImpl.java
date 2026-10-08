@@ -299,6 +299,7 @@ public class KarvaChauthWebhookServiceImpl implements KarvaChauthWebhookService 
             String payload = null;   // button / list-row id
             String typed = null;     // typed text
             String title = null;     // visible button text (used to recognise Step 0 buttons)
+            JsonNode location = null; // shared location ("Visit nearby store" → "Send location")
 
             if (t.equals("text")) {
                 JsonNode textNode = msg.path("text");
@@ -321,6 +322,8 @@ public class KarvaChauthWebhookServiceImpl implements KarvaChauthWebhookService 
                 } else if (nfm.isObject()) {
                     log.info("stage=NOT_BUILT eventId={} — WhatsApp Flow reply (C2 store booking)", eventId);
                 }
+            } else if (t.equals("location")) {                       // she shared her location
+                location = msg.path("location");
             }
 
             if (payload != null && !payload.isBlank()) {
@@ -339,6 +342,10 @@ public class KarvaChauthWebhookServiceImpl implements KarvaChauthWebhookService 
                 botEngineService.updateCustomerName(phone, profileName);
                 boolean handled = botEngineService.onTextMessage(phone, typed);
                 log.info("stage=DIRECT_TEXT eventId={} handled={}", eventId, handled);
+            } else if (location != null) {
+                // C2 — location received. Only printed for now, NOT saved.
+                // Later: find the 3 nearest Mia stores to this latitude / longitude and send them.
+                printLocation(eventId, phone, location, msg);
             } else {
                 log.info("stage=DIRECT_IGNORED eventId={} messageType={} — not a button or text "
                         + "(image, sticker, location…). If it WAS a button/text, check the field names above.", eventId, type);
@@ -351,6 +358,22 @@ public class KarvaChauthWebhookServiceImpl implements KarvaChauthWebhookService 
         } finally {
             MDC.clear();
         }
+    }
+
+    /**
+     * Prints the location she shared — latitude, longitude, and the place name / address when she
+     * picked a place instead of her current location. Nothing is saved.
+     * If latitude / longitude come back empty, the raw message is printed so the Karix field names can be checked.
+     */
+    private void printLocation(String eventId, String phone, JsonNode location, JsonNode msg) {
+        String latitude = text(location, "latitude");
+        String longitude = text(location, "longitude");
+        if (latitude == null || longitude == null) {
+            log.warn("stage=LOCATION_FIELDS_MISSING eventId={} mobile={} raw={}", eventId, mask(phone), msg);
+            return;
+        }
+        log.info("stage=LOCATION_RECEIVED eventId={} mobile={} latitude={} longitude={} name={} address={}",
+                eventId, mask(phone), latitude, longitude, text(location, "name"), text(location, "address"));
     }
 
     /** Which journey a Step 0 template button starts, or null. By payload first, then by visible text. */

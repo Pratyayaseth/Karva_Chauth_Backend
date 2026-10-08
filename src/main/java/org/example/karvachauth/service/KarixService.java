@@ -12,11 +12,11 @@ public interface KarixService {
     /** List message — one tappable row per option. options = {id, title} or {id, title, description}. */
     String sendListMessage(String toPhone, String bodyText, String buttonLabel, List<String[]> options);
 
-//
+    //
     String sendCarousel(String toPhone, String bodyText, List<CarouselCard> cards);
 
     record CarouselCard(String imageUrl, String title, String subtitle, List<String[]> buttons) {}
-//
+    //
 //    /**
 //     * Single URL button that opens an external link when tapped (e.g. a
 //     * wa.me forward link). Karix's cta_url type — unlike quick_reply
@@ -24,4 +24,10 @@ public interface KarixService {
 //     * send a button_reply webhook back, so the bot can't detect the tap.
 //     */
     String sendCtaUrlMessage(String toPhone, String bodyText, String displayText, String url);
+
+    /**
+     * Location request — the message shows a "Send location" button. When she taps it and shares,
+     * a "location" message (latitude / longitude) comes back on the webhook.
+     */
+    String sendLocationRequest(String toPhone, String bodyText);
 }

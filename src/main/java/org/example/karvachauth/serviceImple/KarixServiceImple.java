@@ -64,6 +64,11 @@ public class KarixServiceImple implements KarixService {
         return postForMid(buildCtaUrlPayload(toPhone, bodyText, displayText, url), toPhone, "CTA_URL");
     }
 
+    @Override
+    public String sendLocationRequest(String toPhone, String bodyText) {
+        return postForMid(buildLocationRequestPayload(toPhone, bodyText), toPhone, "LOCATION_REQUEST");
+    }
+
     // ==================================================================
     // PAYLOAD BUILDERS
     // ==================================================================
@@ -177,6 +182,33 @@ public class KarixServiceImple implements KarixService {
         content.put("type", "INTERACTIVE");
         content.put("preview_url", false);
         content.put("shorten_url", false);
+        content.put("interactive", interactive);
+
+        Map<String, Object> preferences = new LinkedHashMap<>();
+        preferences.put("webHookDNId", "1001");
+
+        Map<String, Object> message = new LinkedHashMap<>();
+        message.put("channel", "WABA");
+        message.put("content", content);
+        message.put("recipient", buildRecipient(toPhone));
+        message.put("sender", buildSender());
+        message.put("preferences", preferences);
+
+        return wrap(message);
+    }
+
+    /** WhatsApp location request message — body text + a "Send location" button. */
+    private Map<String, Object> buildLocationRequestPayload(String toPhone, String bodyText) {
+        Map<String, Object> action = new LinkedHashMap<>();
+        action.put("name", "send_location");
+
+        Map<String, Object> interactive = new LinkedHashMap<>();
+        interactive.put("type", "location_request_message");
+        interactive.put("body", Map.of("text", bodyText));
+        interactive.put("action", action);
+
+        Map<String, Object> content = new LinkedHashMap<>();
+        content.put("type", "INTERACTIVE");
         content.put("interactive", interactive);
 
         Map<String, Object> preferences = new LinkedHashMap<>();

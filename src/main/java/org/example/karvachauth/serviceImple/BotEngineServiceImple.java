@@ -328,10 +328,9 @@ public class BotEngineServiceImple implements BotEngineService {
 
         // Shared buttons — same behaviour on every path
         if (isStoreVisitTap(p)) {
-            // C2 — session is now on BOOK_STORE_VISIT (stepForTap). The booking form goes here once built;
-            // for a product card, p.substring(6) is the SKU to reserve.
-            log.info("stage=NOT_BUILT sessionId={} payload={} step={} (C2 Book a store visit — form not sent yet)",
-                    session.getId(), p, session.getCurrentStep());
+            // C2 — session is now on BOOK_STORE_VISIT (stepForTap). Ask her to share her location;
+            // for a product card, p.substring(6) is the SKU she tapped.
+            handled = askForLocation(session);
         } else if ("TEST_C2_BOOKED".equals(p)) {
             // TEST ONLY — pretends the C2 booking just completed, so 1I can be tested before C2 exists.
             // No real button ever sends this. Delete this branch once C2 is built.
@@ -438,6 +437,21 @@ public class BotEngineServiceImple implements BotEngineService {
                     : category ? STEP_S_PICK_CATEGORY : null;
             default -> null;
         };
+    }
+
+    /**
+     * C2 — "Visit nearby store" / "Visit Store" tapped: asks her to share her current location.
+     * The message is saved on BOOK_STORE_VISIT. Her location comes back as a "location" message,
+     * which the webhook prints (not saved yet). Showing the 3 nearest Mia stores comes later.
+     */
+    private boolean askForLocation(Session session) {
+        String text = "Let's find a Mia store near you 📍 "
+                + "Tap *Send location* below to share your current location.";
+        String mid = karixService.sendLocationRequest(session.getPhone(), text);
+        recordOutbound(session, "interactive", text, mid);
+        log.info("stage=LOCATION_REQUEST_SENT sessionId={} path={} step={} sent={}",
+                session.getId(), session.getPath(), session.getCurrentStep(), mid != null);
+        return mid != null;
     }
 
     /** "Visit nearby store" / "📍 Visit Store" (BTN_STORE_FINDER) or "Visit Store" on a product card (VISIT_<sku>). */
