@@ -30,6 +30,17 @@ public interface DashboardService {
 
     Map<String, Object> getStoreBookings(String flow, String range, String startDate, String endDate, int page);
 
+    // ---------------- Referral Leads page ----------------
+
+    Map<String, Object> getReferralLeadsSummary(String flow, String range, String startDate, String endDate);
+
+    /** show : all / husbands / wives / consented ("Consent: yes") */
+    Map<String, Object> getReferralLeads(String flow, String range, String startDate, String endDate,
+                                         String show, int page);
+
+    Map<String, Object> exportReferralLeads(String flow, String range, String startDate, String endDate,
+                                            String show, String scope, int page);
+
     /**
      * Every filter on the Conversations page — the controller builds it from the request params.
      *

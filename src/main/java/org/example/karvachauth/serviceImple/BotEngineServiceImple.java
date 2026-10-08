@@ -13,13 +13,13 @@ import org.example.karvachauth.repository.CustomerRepository;
 import org.example.karvachauth.repository.LeadRepository;
 import org.example.karvachauth.repository.MessageRepository;
 import org.example.karvachauth.repository.ProductPickRepository;
-// import org.example.karvachauth.repository.ProductRepository;   // PRODUCTION
-// import org.springframework.data.domain.Pageable;                 // PRODUCTION
+import org.example.karvachauth.repository.ProductRepository;
 import org.example.karvachauth.repository.SessionRepository;
 import org.example.karvachauth.repository.WishlistItemRepository;
 import org.example.karvachauth.service.BotEngineService;
 import org.example.karvachauth.service.KarixService;
-import org.springframework.data.domain.PageRequest;               // idle query now; product queries in PRODUCTION
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.scheduling.TaskScheduler;
@@ -35,9 +35,12 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.time.format.ResolverStyle;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
 import static org.example.karvachauth.constants.KarvaChauthConstants.*;
 
@@ -53,6 +56,7 @@ public class BotEngineServiceImple implements BotEngineService {
     private final WishlistItemRepository wishlistItemRepository;
     private final LeadRepository leadRepository;                 // conversions → dashboard funnel
     private final ProductPickRepository productPickRepository;   // product interactions → "top products"
+    private final ProductRepository productRepository;           // the catalogue — carousels, wishlist, Ishara, Buy Online
     private final TaskScheduler taskScheduler;   // needs @EnableScheduling on the application class
 
     /**
@@ -60,8 +64,6 @@ public class BotEngineServiceImple implements BotEngineService {
      * Cleared at the start of every tap / text / opener / follow-up, so it never leaks into the next one.
      */
     private final ThreadLocal<Message> lastOutbound = new ThreadLocal<>();
-    // PRODUCTION: uncomment together with the queries in sendProductPage()
-    // private final ProductRepository productRepository;
 
     /** Minutes of silence before the IDLE nudge. 60 in production — set it to 1-2 in dev to test quickly. */
     @Value("${karvachauth.idle.minutes:60}")
@@ -107,71 +109,6 @@ public class BotEngineServiceImple implements BotEngineService {
             {"RING", "Rings",               "A little gold for every gesture",                 IMG + "Rings.png"},
             {"BRBG", "Bracelets & Bangles", "Wrist candy, the grown-up way",                   IMG + "Bracelets%20&%20Bangles.png"}
     };
-
-    // ==================================================================
-    // DUMMY CATALOGUE — TESTING ONLY
-    // Used until the Mia team's catalogue is loaded into the products table.
-    // When it is: delete this block and switch sendProductPage() back to the PRODUCTION lines.
-    // Pendants has 11 items on purpose, so "See more" (2nd page) can be tested.
-    // ==================================================================
-    private static final List<Product> DUMMY_PRODUCTS = buildDummyProducts();
-
-    private static List<Product> buildDummyProducts() {
-        List<Product> list = new ArrayList<>();
-
-        addDummy(list, CAT_PENDANTS, "D-PEND", IMG + "Pendants.png",
-                new String[]{"Heart Glow Pendant", "Petal Drop Pendant", "Starlight Pendant", "Crescent Moon Pendant",
-                        "Infinity Loop Pendant", "Teardrop Pendant", "Floral Halo Pendant", "Leaf Charm Pendant",
-                        "Evil Eye Pendant", "Butterfly Pendant", "Solitaire Pendant"},
-                new int[]{18500, 24900, 32000, 41500, 52000, 64500, 78000, 95000, 112000, 145000, 215000});
-
-        addDummy(list, CAT_MIA_SUTRA, "D-MSUT", IMG + "Pendants.png",
-                new String[]{"Mia Sutra Classic", "Mia Sutra Bloom", "Mia Sutra Diamond Line"},
-                new int[]{38000, 72000, 135000});
-
-        addDummy(list, CAT_PENDANT_CHAIN, "D-PNCH", IMG + "Pendant%20&%20Chain.png",
-                new String[]{"Heart Pendant & Chain", "Twin Star Set", "Pearl Drop Set"},
-                new int[]{29000, 58000, 99000});
-
-        addDummy(list, CAT_NECKLACES, "D-NECK", IMG + "Necklaces.png",
-                new String[]{"Delicate Link Necklace", "Floral Vine Necklace", "Statement Collar Necklace"},
-                new int[]{46000, 118000, 225000});
-
-        addDummy(list, CAT_EARRINGS, "D-EARR", IMG + "Earrings.png",
-                new String[]{"Petite Stud Earrings", "Drop Hoop Earrings", "Chandelier Earrings"},
-                new int[]{15500, 47000, 88000});
-
-        addDummy(list, CAT_RINGS, "D-RING", IMG + "Rings.png",
-                new String[]{"Minimal Band Ring", "Twist Knot Ring", "Halo Cocktail Ring"},
-                new int[]{21000, 54000, 162000});
-
-        addDummy(list, CAT_BRACELETS_BANGLES, "D-BRBG", IMG + "Bracelets%20&%20Bangles.png",
-                new String[]{"Charm Bracelet", "Slim Gold Bangle", "Diamond Tennis Bracelet"},
-                new int[]{33000, 76000, 198000});
-
-        return list;
-    }
-
-    /**
-     * SKUs look like D-PEND-01. Note: a real SKU must never END in "_<digits>",
-     * because onButtonTap strips "_<digits>" (the carousel card-index suffix).
-     */
-    private static void addDummy(List<Product> list, String category, String skuPrefix, String image,
-                                 String[] names, int[] prices) {
-        for (int i = 0; i < names.length; i++) {
-            list.add(Product.builder()
-                    .sku(String.format("%s-%02d", skuPrefix, i + 1))
-                    .name(names[i])
-                    .category(category)
-                    .price(prices[i])
-                    .imageUrl(image)
-                    .buyLink("https://www.miabytanishq.com/")   // TODO: real product link
-                    .displayOrder(i)
-                    .active(true)
-                    .build());
-        }
-    }
-
 
     // ==================================================================
     // STEP 0 — OPENER
@@ -771,42 +708,45 @@ public class BotEngineServiceImple implements BotEngineService {
         // Budget band — set on Sparkle / Husband after the budget list; null on the Wife path
         int[] range = priceRange(session.getSelectedBudget());
 
-        // ---------- PRODUCTION: whole category from the products table (uncomment when the catalogue is loaded) ----------
-        // List<Product> allInCategory = productRepository.findByCategoryAndActiveTrueOrderByDisplayOrderAscPriceAsc(
-        //         category, Pageable.unpaged());
+        // The whole category from the products table — active pieces only, in the Mia team's display order
+        List<Product> allInCategory = productRepository.findByCategoryAndActiveTrueOrderByDisplayOrderAscPriceAsc(
+                category, Pageable.unpaged());
 
-        // ---------- TESTING: dummy catalogue (delete when the PRODUCTION line above is enabled) ----------
-        List<Product> allInCategory = DUMMY_PRODUCTS.stream()
-                .filter(prod -> category.equals(prod.getCategory()))
-                .toList();
-        // ---------- end TESTING ----------
-
-        // Budget ordering (Sparkle / Husband): pieces IN her budget first, then the rest of the category.
-        //   - 9+ in budget      → only budget pieces on page 1 (rest follow on "See more")
-        //   - fewer than 9      → budget pieces first, the carousel is topped up with other pieces of the category
-        //   - none in budget    → the whole category
-        // This also keeps every carousel at 2+ cards whenever the category has 2+ products (WhatsApp's minimum).
+        // Budget (Sparkle / Husband):
+        //   - pieces in her budget → ONLY those pieces (4 in budget → 4 cards; 12 → 9 + "See more" for 3)
+        //   - none in her budget   → the whole category
+        //   - exactly 1 in budget  → that piece + the closest-priced other piece, because a WhatsApp
+        //                            carousel needs at least 2 cards
+        // Wife: no budget, the whole category.
         List<Product> pool;
         int inBudgetCount;
         if (range != null) {
             List<Product> inBand = allInCategory.stream()
                     .filter(prod -> prod.getPrice() != null && prod.getPrice() >= range[0] && prod.getPrice() <= range[1])
                     .toList();
-            List<Product> others = allInCategory.stream()
-                    .filter(prod -> !inBand.contains(prod))
-                    .toList();
-            pool = new ArrayList<>(inBand);
-            pool.addAll(others);
             inBudgetCount = inBand.size();
+            if (inBand.isEmpty()) {
+                pool = allInCategory;
+            } else if (inBand.size() == 1 && allInCategory.size() > 1) {
+                pool = withClosestPricedPiece(inBand.get(0), allInCategory);
+            } else {
+                pool = inBand;
+            }
         } else {
-            pool = allInCategory;                 // Wife: no budget, whole category
+            pool = allInCategory;
             inBudgetCount = allInCategory.size();
         }
-        boolean budgetFallback = range != null && inBudgetCount < Math.min(PRODUCT_PAGE_SIZE, pool.size());
+        // true when the carousel shows pieces outside her budget (none in budget, or the 1-piece top-up)
+        boolean budgetFallback = range != null && pool.size() > inBudgetCount;
 
         long total = pool.size();
         int fromIdx = Math.min(page * PRODUCT_PAGE_SIZE, pool.size());
         int toIdx = Math.min(fromIdx + PRODUCT_PAGE_SIZE, pool.size());
+        // A last page with a single piece (e.g. 10 products → page 2 has 1) would be a 1-card carousel,
+        // which WhatsApp rejects — start that page one piece earlier so it shows the last 2.
+        if (toIdx - fromIdx == 1 && fromIdx > 0) {
+            fromIdx--;
+        }
         List<Product> products = pool.subList(fromIdx, toIdx);
 
         boolean hasMore = (long) (page + 1) * PRODUCT_PAGE_SIZE < total;
@@ -846,7 +786,7 @@ public class BotEngineServiceImple implements BotEngineService {
         }
 
         // Same text whether or not the budget fallback kicked in — she just sees the products.
-        // (budgetFallback = carousel topped up with pieces outside her budget — logged below.)
+        // (budgetFallback = pieces outside her budget are shown — logged below.)
         String bodyText = again
                 ? "Here's *" + title + "* again 💛 Take your time."                 // 1D
                 : "Here's what's beautiful in *" + title + "* 💛 Take your time.";  // 1B / 2B / See more
@@ -868,6 +808,19 @@ public class BotEngineServiceImple implements BotEngineService {
             scheduleBrowseControls(session.getId(), nextStep, category, page, title, hasMore);
         }
         return true;
+    }
+
+    /**
+     * The one in-budget piece followed by the other piece of the category whose price is closest to it —
+     * so the carousel still has the 2 cards WhatsApp needs.
+     */
+    private static List<Product> withClosestPricedPiece(Product inBudget, List<Product> allInCategory) {
+        int price = inBudget.getPrice() == null ? 0 : inBudget.getPrice();
+        Product closest = allInCategory.stream()
+                .filter(prod -> prod != inBudget)
+                .min(Comparator.comparingInt(prod -> Math.abs((prod.getPrice() == null ? 0 : prod.getPrice()) - price)))
+                .orElse(null);
+        return closest == null ? List.of(inBudget) : List.of(inBudget, closest);
     }
 
     /**
@@ -1029,15 +982,14 @@ public class BotEngineServiceImple implements BotEngineService {
         return sendProductPage(session, code, step, true);
     }
 
-    /** Product by SKU — from the DB in production, from the dummy catalogue for now. */
+    /**
+     * An active product by SKU, or null. Used when she taps a product (Add to my list / Buy this for her /
+     * Buy Online): a piece the Mia team has switched off (active = false) can't be picked from an old carousel.
+     */
     private Product findProduct(String sku) {
-        // ---------- PRODUCTION (uncomment with the other PRODUCTION lines) ----------
-        // return productRepository.findBySku(sku).orElse(null);
-
-        // ---------- TESTING: dummy catalogue ----------
-        return DUMMY_PRODUCTS.stream()
-                .filter(prod -> sku.equals(prod.getSku()))
-                .findFirst()
+        if (sku == null || sku.isBlank()) return null;
+        return productRepository.findBySku(sku)
+                .filter(product -> Boolean.TRUE.equals(product.getActive()))
                 .orElse(null);
     }
 
@@ -1064,12 +1016,17 @@ public class BotEngineServiceImple implements BotEngineService {
             return mid != null;
         }
 
-        // 1. The list of pieces — "• *Name* - ≈₹price"
+        // 1. The list of pieces — "• *Name* - ≈₹price". All of her pieces in one query; a piece already on
+        //    her list is still shown even if it has since been switched off.
+        Map<String, Product> productsBySku = productRepository
+                .findBySkuIn(items.stream().map(WishlistItem::getSku).toList())
+                .stream()
+                .collect(Collectors.toMap(Product::getSku, product -> product, (first, second) -> first));
         StringBuilder lines = new StringBuilder();
         int shown = 0;
         for (WishlistItem item : items) {
             if (shown >= MAX_HINT_ITEMS) break;
-            Product prod = findProduct(item.getSku());
+            Product prod = productsBySku.get(item.getSku());
             if (prod == null) continue;
             lines.append("• *").append(prod.getName()).append("*");
             if (prod.getPrice() != null) lines.append(" - ≈₹").append(formatInr(prod.getPrice()));

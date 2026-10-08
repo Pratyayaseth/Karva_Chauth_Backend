@@ -538,4 +538,84 @@ public interface DashboardRepository extends JpaRepository<Lead, Long> {
                                                 @Param("to") LocalDateTime to,
                                                 @Param("limit") int limit,
                                                 @Param("offset") int offset);
+
+    // ==================================================================
+    // REFERRAL LEADS PAGE — partner details captured at 1J/1K (husband) and 2F/2G (wife)
+    // Event window on leads.created_at (when she / he answered the consent question).
+    // Every captured contact counts, consent YES or NO; the bot keeps the partner's mobile only on YES.
+    // ==================================================================
+
+    interface ReferralSummaryProjection {
+        Long getTotal();
+        Long getHusbands();
+        Long getWives();
+        Long getConsented();       // consent = YES
+        Long getMessageable();     // consent = YES and a mobile was kept
+    }
+
+    @Query(nativeQuery = true, value =
+            "SELECT COUNT(*) AS total, " +
+                    "       COALESCE(SUM(CASE WHEN l.lead_type = 'HUSBAND_CAPTURED' THEN 1 ELSE 0 END), 0) AS husbands, " +
+                    "       COALESCE(SUM(CASE WHEN l.lead_type = 'WIFE_CAPTURED' THEN 1 ELSE 0 END), 0) AS wives, " +
+                    "       COALESCE(SUM(CASE WHEN l.consent = 'YES' THEN 1 ELSE 0 END), 0) AS consented, " +
+                    "       COALESCE(SUM(CASE WHEN l.consent = 'YES' AND l.partner_phone IS NOT NULL " +
+                    "                          AND l.partner_phone <> '' THEN 1 ELSE 0 END), 0) AS messageable " +
+                    "FROM leads l " +
+                    "WHERE l.lead_type IN ('HUSBAND_CAPTURED', 'WIFE_CAPTURED') " +
+                    "  AND (:path IS NULL OR l.path = :path) " +
+                    "  AND l.created_at >= :from AND l.created_at < :to")
+    ReferralSummaryProjection summarizeReferralLeads(@Param("path") String path,
+                                                     @Param("from") LocalDateTime from,
+                                                     @Param("to") LocalDateTime to);
+
+    interface ReferralLeadRowProjection {
+        Long getLeadId();
+        String getCustomerName();
+        String getPhone();               // the customer who shared the contact
+        String getPath();
+        String getLeadType();            // HUSBAND_CAPTURED / WIFE_CAPTURED
+        String getPartnerName();
+        String getPartnerPhone();        // null when consent is NO
+        LocalDate getPartnerDate();
+        String getPartnerDateType();     // ANNIVERSARY / BIRTHDAY
+        String getConsent();             // YES / NO
+        LocalDateTime getCapturedAt();
+    }
+
+    /**
+     * Table filter: leadTypes = both types, or one ("Husbands" / "Wives");
+     * consentedOnly = true for "Consent: yes".
+     */
+    String REFERRAL_LEAD_FILTERS =
+            "WHERE l.lead_type IN (:leadTypes) " +
+                    "  AND (:consentedOnly = FALSE OR l.consent = 'YES') " +
+                    "  AND (:path IS NULL OR l.path = :path) " +
+                    "  AND l.created_at >= :from AND l.created_at < :to ";
+
+    /** One page of referral leads, newest first. Export uses the same query with a bigger limit. */
+    @Query(nativeQuery = true, value =
+            "SELECT l.id AS leadId, COALESCE(l.customer_name, c.name) AS customerName, l.phone AS phone, " +
+                    "       l.path AS path, l.lead_type AS leadType, l.partner_name AS partnerName, " +
+                    "       l.partner_phone AS partnerPhone, l.partner_date AS partnerDate, " +
+                    "       l.partner_date_type AS partnerDateType, l.consent AS consent, l.created_at AS capturedAt " +
+                    "FROM leads l " +
+                    "LEFT JOIN customers c ON c.phone = l.phone " +
+                    REFERRAL_LEAD_FILTERS +
+                    "ORDER BY l.created_at DESC, l.id DESC " +
+                    "LIMIT :limit OFFSET :offset")
+    List<ReferralLeadRowProjection> findReferralLeadsPage(@Param("leadTypes") List<String> leadTypes,
+                                                          @Param("consentedOnly") boolean consentedOnly,
+                                                          @Param("path") String path,
+                                                          @Param("from") LocalDateTime from,
+                                                          @Param("to") LocalDateTime to,
+                                                          @Param("limit") int limit,
+                                                          @Param("offset") int offset);
+
+    @Query(nativeQuery = true, value =
+            "SELECT COUNT(*) FROM leads l " + REFERRAL_LEAD_FILTERS)
+    long countReferralLeadsForTable(@Param("leadTypes") List<String> leadTypes,
+                                    @Param("consentedOnly") boolean consentedOnly,
+                                    @Param("path") String path,
+                                    @Param("from") LocalDateTime from,
+                                    @Param("to") LocalDateTime to);
 }

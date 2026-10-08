@@ -1097,6 +1097,244 @@ public class DashboardServiceImple implements DashboardService {
     }
 
     // ==================================================================
+    // REFERRAL LEADS PAGE
+    // Contacts a customer shared for a future occasion: his details from the Wife path (1J → 1K)
+    // and her details from the Husband path (2F → 2G). Counted by when the consent was answered.
+    // ==================================================================
+
+    private static final int REFERRAL_PAGE_SIZE = 50;
+    private static final DateTimeFormatter KEY_DATE = DateTimeFormatter.ofPattern("dd/MM");
+
+    private static final List<String> REFERRAL_EXPORT_COLUMNS = List.of(
+            "Referred By", "Path", "Referred Contact", "Relation", "Mobile", "Key Date", "Consent", "Status", "Captured At");
+
+    /**
+     * The 5 cards + the Opt-in Leads section.
+     * A card that doesn't apply to the selected path is null (shown as "—"):
+     * Husbands Referred and Ishara Forwards exist only on "I'm celebrating", Wives Referred only on "Shopping for her".
+     */
+    @Override
+    public Map<String, Object> getReferralLeadsSummary(String flow, String range, String startDate, String endDate) {
+        DateWindow window = resolveDateTimeRange(range, startDate, endDate);
+        String pathType = flowToPathType(flow);
+        boolean allPaths = pathType == null;
+        boolean wifePath = allPaths || TEMPLATE_WIFE.equals(pathType);
+        boolean husbandPath = allPaths || TEMPLATE_HUSBAND.equals(pathType);
+
+        DashboardRepository.ReferralSummaryProjection referrals =
+                dashboardRepo.summarizeReferralLeads(pathType, window.from(), window.to());
+        long total = referrals == null ? 0 : valueOrZero(referrals.getTotal());
+        long consented = referrals == null ? 0 : valueOrZero(referrals.getConsented());
+
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("referralLeads", total);
+        data.put("husbandsReferred", wifePath ? (referrals == null ? 0L : valueOrZero(referrals.getHusbands())) : null);
+        data.put("wivesReferred", husbandPath ? (referrals == null ? 0L : valueOrZero(referrals.getWives())) : null);
+        data.put("consentGivenPct", pctWhole(consented, total));
+        data.put("canBeMessaged", referrals == null ? 0L : valueOrZero(referrals.getMessageable()));
+        // Ishara sent — the husband hears about it, but his number isn't captured
+        data.put("isharaForwards", wifePath
+                ? dashboardRepo.countLeadsByType(LEAD_HINT_SENT, pathType, window.from(), window.to())
+                : null);
+        data.put("optInLeads", buildOptInSection(window));
+        data.put("flow", normaliseFlow(flow));
+        data.put("range", normaliseRange(range));
+        return data;
+    }
+
+    /**
+     * "Here for the sparkle" customers who said yes to new arrivals and offers. Only the Sparkle path asks,
+     * so this is always the Sparkle numbers for the date range, whichever path tab is selected.
+     */
+    private Map<String, Object> buildOptInSection(DateWindow window) {
+        long optedIn = dashboardRepo.countLeadsByType(LEAD_SPARKLE_OPT_IN, TEMPLATE_SPARKLE, window.from(), window.to());
+        long optedOut = dashboardRepo.countLeadsByType(LEAD_SPARKLE_OPT_OUT, TEMPLATE_SPARKLE, window.from(), window.to());
+        long sparkleOpenerTaps = dashboardRepo.countOpenerTaps(TEMPLATE_SPARKLE, window.from(), window.to());
+
+        Map<String, Object> optIn = new LinkedHashMap<>();
+        optIn.put("optedIn", optedIn);
+        optIn.put("pctOfSparkleOpenerTaps", pct(optedIn, sparkleOpenerTaps));
+        optIn.put("sparkleOpenerTaps", sparkleOpenerTaps);
+        optIn.put("optedOut", optedOut);
+        return optIn;
+    }
+
+    @Override
+    public Map<String, Object> getReferralLeads(String flow, String range, String startDate, String endDate,
+                                                String show, int page) {
+        DateWindow window = resolveDateTimeRange(range, startDate, endDate);
+        String pathType = flowToPathType(flow);
+        String showFilter = normaliseReferralShow(show);
+        int safePage = Math.max(page, 0);
+
+        long totalElements = countReferralRows(showFilter, pathType, window);
+        List<DashboardRepository.ReferralLeadRowProjection> rows =
+                findReferralRows(showFilter, pathType, window, REFERRAL_PAGE_SIZE, safePage * REFERRAL_PAGE_SIZE);
+
+        LocalDateTime now = LocalDateTime.now();
+        List<Map<String, Object>> tableRows = new ArrayList<>();
+        for (DashboardRepository.ReferralLeadRowProjection row : rows) {
+            tableRows.add(toReferralRow(row, now));
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("rows", tableRows);
+        result.put("page", safePage);
+        result.put("size", REFERRAL_PAGE_SIZE);
+        result.put("totalElements", totalElements);
+        result.put("totalPages", (totalElements + REFERRAL_PAGE_SIZE - 1) / REFERRAL_PAGE_SIZE);
+        result.put("show", showFilter);
+        result.put("flow", normaliseFlow(flow));
+        result.put("range", normaliseRange(range));
+        return result;
+    }
+
+    @Override
+    public Map<String, Object> exportReferralLeads(String flow, String range, String startDate, String endDate,
+                                                   String show, String scope, int page) {
+        DateWindow window = resolveDateTimeRange(range, startDate, endDate);
+        String pathType = flowToPathType(flow);
+        String showFilter = normaliseReferralShow(show);
+        String exportScope = hasText(scope) ? scope.trim().toLowerCase() : "all";
+        if (!exportScope.equals("page") && !exportScope.equals("all")) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "scope must be page or all");
+        }
+        int safePage = Math.max(page, 0);
+        boolean currentPageOnly = exportScope.equals("page");
+
+        long totalElements = countReferralRows(showFilter, pathType, window);
+        List<DashboardRepository.ReferralLeadRowProjection> rows = currentPageOnly
+                ? findReferralRows(showFilter, pathType, window, REFERRAL_PAGE_SIZE, safePage * REFERRAL_PAGE_SIZE)
+                : findReferralRows(showFilter, pathType, window, MAX_EXPORT_ROWS, 0);
+
+        List<Map<String, String>> exportRows = new ArrayList<>();
+        for (DashboardRepository.ReferralLeadRowProjection row : rows) {
+            Map<String, String> exportRow = new LinkedHashMap<>();
+            exportRow.put("Referred By", textOrEmpty(row.getCustomerName()));
+            exportRow.put("Path", pathLabel(row.getPath()));
+            exportRow.put("Referred Contact", textOrEmpty(row.getPartnerName()));
+            exportRow.put("Relation", relationLabel(row.getLeadType()));
+            exportRow.put("Mobile", hasText(row.getPartnerPhone()) ? formatPhone(row.getPartnerPhone()) : "");
+            exportRow.put("Key Date", keyDateLabel(row.getPartnerDateType(), row.getPartnerDate()));
+            exportRow.put("Consent", consentLabel(row.getConsent()));
+            exportRow.put("Status", referralStatusLabel(row.getConsent()));
+            exportRow.put("Captured At", row.getCapturedAt() == null ? "" : row.getCapturedAt().format(EXPORT_DATE_TIME));
+            exportRows.add(exportRow);
+        }
+
+        boolean truncated = !currentPageOnly && totalElements > MAX_EXPORT_ROWS;
+        if (truncated) {
+            log.warn("stage=REFERRAL_EXPORT_TRUNCATED total={} exported={}", totalElements, MAX_EXPORT_ROWS);
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("columns", REFERRAL_EXPORT_COLUMNS);
+        result.put("rows", exportRows);
+        result.put("scope", exportScope);
+        result.put("page", safePage);
+        result.put("totalElements", totalElements);
+        result.put("exportedRows", exportRows.size());
+        result.put("truncated", truncated);
+        result.put("show", showFilter);
+        result.put("flow", normaliseFlow(flow));
+        result.put("range", normaliseRange(range));
+        return result;
+    }
+
+    private Map<String, Object> toReferralRow(DashboardRepository.ReferralLeadRowProjection row, LocalDateTime now) {
+        boolean husband = LEAD_HUSBAND_CAPTURED.equals(row.getLeadType());
+
+        Map<String, Object> tableRow = new LinkedHashMap<>();
+        tableRow.put("leadId", row.getLeadId());
+        // Referred by — the customer who shared the contact
+        tableRow.put("referredBy", displayName(row.getCustomerName(), row.getPhone()));
+        tableRow.put("flow", pathToFlow(row.getPath()));
+        tableRow.put("pathLabel", pathLabel(row.getPath()));
+        tableRow.put("capturedAt", row.getCapturedAt());
+        tableRow.put("minutesAgo", row.getCapturedAt() == null ? null
+                : ChronoUnit.MINUTES.between(row.getCapturedAt(), now));
+        // Referred contact
+        tableRow.put("contactName", row.getPartnerName());
+        tableRow.put("contactStep", husband ? "1J" : "2F");
+        tableRow.put("relation", relationLabel(row.getLeadType()));
+        tableRow.put("mobile", hasText(row.getPartnerPhone()) ? maskPhone(row.getPartnerPhone()) : null);
+        tableRow.put("keyDateType", row.getPartnerDateType());
+        tableRow.put("keyDate", row.getPartnerDate());
+        tableRow.put("keyDateLabel", keyDateLabel(row.getPartnerDateType(), row.getPartnerDate()));
+        tableRow.put("consent", row.getConsent());
+        tableRow.put("consentLabel", consentLabel(row.getConsent()));
+        tableRow.put("status", CONSENT_YES.equalsIgnoreCase(row.getConsent()) ? "NEW" : "CONSENT_NOT_GIVEN");
+        tableRow.put("statusLabel", referralStatusLabel(row.getConsent()));
+        return tableRow;
+    }
+
+    /** all → both types; husbands / wives → one type; consented → both types, consent YES only. */
+    private String normaliseReferralShow(String show) {
+        String value = hasText(show) ? show.trim().toLowerCase() : "all";
+        return switch (value) {
+            case "all", "husbands", "wives", "consented" -> value;
+            case "husband" -> "husbands";
+            case "wife" -> "wives";
+            case "consent", "yes" -> "consented";
+            default -> throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "show must be all, husbands, wives or consented");
+        };
+    }
+
+    private List<String> referralLeadTypesFor(String showFilter) {
+        return switch (showFilter) {
+            case "husbands" -> List.of(LEAD_HUSBAND_CAPTURED);
+            case "wives" -> List.of(LEAD_WIFE_CAPTURED);
+            default -> ALL_REFERRAL_TYPES;
+        };
+    }
+
+    private long countReferralRows(String showFilter, String pathType, DateWindow window) {
+        return dashboardRepo.countReferralLeadsForTable(referralLeadTypesFor(showFilter),
+                showFilter.equals("consented"), pathType, window.from(), window.to());
+    }
+
+    private List<DashboardRepository.ReferralLeadRowProjection> findReferralRows(String showFilter, String pathType,
+                                                                                 DateWindow window, int limit, int offset) {
+        return dashboardRepo.findReferralLeadsPage(referralLeadTypesFor(showFilter),
+                showFilter.equals("consented"), pathType, window.from(), window.to(), limit, offset);
+    }
+
+    private String relationLabel(String leadType) {
+        if (LEAD_HUSBAND_CAPTURED.equals(leadType)) return "Husband";
+        if (LEAD_WIFE_CAPTURED.equals(leadType)) return "Wife";
+        return "";
+    }
+
+    /** "Anniversary 05/05" / "Birthday 06/01" — day/month only, the year doesn't matter for a reminder. */
+    private String keyDateLabel(String dateType, LocalDate date) {
+        if (date == null) return "";
+        String type = "BIRTHDAY".equalsIgnoreCase(dateType) ? "Birthday"
+                : "ANNIVERSARY".equalsIgnoreCase(dateType) ? "Anniversary" : "";
+        return (type + " " + date.format(KEY_DATE)).trim();
+    }
+
+    private String consentLabel(String consent) {
+        if (CONSENT_YES.equalsIgnoreCase(consent)) return "Yes";
+        if (CONSENT_NO.equalsIgnoreCase(consent)) return "No";
+        return "";
+    }
+
+    /**
+     * "Consent not given" when she / he said no. A YES contact is "New" — nothing records follow-ups yet;
+     * Messaged / Reminder scheduled / Visited store need a status saved when that happens.
+     */
+    private String referralStatusLabel(String consent) {
+        return CONSENT_YES.equalsIgnoreCase(consent) ? "New" : "Consent not given";
+    }
+
+    /** Whole-number percentage, e.g. 73 — used by the Consent Given card. */
+    private long pctWhole(long part, long total) {
+        if (total <= 0) return 0L;
+        return Math.round((part * 100.0) / total);
+    }
+
+    // ==================================================================
     // HELPERS
     // ==================================================================
 

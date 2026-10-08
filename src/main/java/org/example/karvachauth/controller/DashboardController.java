@@ -9,7 +9,7 @@ import org.springframework.web.bind.annotation.*;
 import java.util.Map;
 
 /**
- * Dashboard APIs — Overview, Conversations and Store Visits pages.
+ * Dashboard APIs — Overview, Conversations, Store Visits and Referral Leads pages.
  *
  * flow  : all / celebrating / shopping / sparkle
  * range : today / 7d / 30d / custom   (custom needs from + to as yyyy-MM-dd, both inclusive)
@@ -144,5 +144,50 @@ public class DashboardController {
             @RequestParam(required = false) String to,
             @RequestParam(defaultValue = "0") int page) {
         return ResponseEntity.ok(dashboardService.getStoreBookings(flow, range, from, to, page));
+    }
+
+    // ==================================================================
+    // REFERRAL LEADS PAGE
+    // ==================================================================
+
+    /** The 5 cards and the Opt-in Leads section. */
+    @GetMapping("/referral-leads/summary")
+    public ResponseEntity<Map<String, Object>> referralLeadsSummary(
+            @RequestParam(defaultValue = "all") String flow,
+            @RequestParam(defaultValue = "today") String range,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to) {
+        return ResponseEntity.ok(dashboardService.getReferralLeadsSummary(flow, range, from, to));
+    }
+
+    /**
+     * The table — newest first, 50 rows per page, page starts at 0.
+     * show : all / husbands / wives / consented
+     */
+    @GetMapping("/referral-leads")
+    public ResponseEntity<Map<String, Object>> referralLeads(
+            @RequestParam(defaultValue = "all") String flow,
+            @RequestParam(defaultValue = "today") String range,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(defaultValue = "all") String show,
+            @RequestParam(defaultValue = "0") int page) {
+        return ResponseEntity.ok(dashboardService.getReferralLeads(flow, range, from, to, show, page));
+    }
+
+    /**
+     * Rows for "Copy as CSV" / export, with the same filters as the table. The frontend builds the file.
+     * scope : page (the 50 rows of ?page=) / all (every row for the filters, up to 10,000)
+     */
+    @GetMapping("/referral-leads/export")
+    public ResponseEntity<Map<String, Object>> referralLeadsExport(
+            @RequestParam(defaultValue = "all") String flow,
+            @RequestParam(defaultValue = "today") String range,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(defaultValue = "all") String show,
+            @RequestParam(defaultValue = "all") String scope,
+            @RequestParam(defaultValue = "0") int page) {
+        return ResponseEntity.ok(dashboardService.exportReferralLeads(flow, range, from, to, show, scope, page));
     }
 }
