@@ -216,7 +216,7 @@ public class DashboardController {
             @RequestParam(defaultValue = "today") String range,
             @RequestParam(required = false) String from,
             @RequestParam(required = false) String to,
-            @RequestParam(defaultValue = "true") boolean fullMobile) {
+            @RequestParam(defaultValue = "false") boolean fullMobile) {
         return ResponseEntity.ok(dashboardService.getHintSentNoVisitAudience(range, from, to, fullMobile));
     }
 
@@ -226,7 +226,7 @@ public class DashboardController {
             @RequestParam(defaultValue = "today") String range,
             @RequestParam(required = false) String from,
             @RequestParam(required = false) String to,
-            @RequestParam(defaultValue = "true") boolean fullMobile) {
+            @RequestParam(defaultValue = "false") boolean fullMobile) {
         return ResponseEntity.ok(dashboardService.getListStartedNoHintAudience(range, from, to, fullMobile));
     }
 
@@ -236,7 +236,7 @@ public class DashboardController {
             @RequestParam(defaultValue = "today") String range,
             @RequestParam(required = false) String from,
             @RequestParam(required = false) String to,
-            @RequestParam(defaultValue = "true") boolean fullMobile) {
+            @RequestParam(defaultValue = "false") boolean fullMobile) {
         return ResponseEntity.ok(dashboardService.getBrowsingNoPurchaseAudience(range, from, to, fullMobile));
     }
 
@@ -246,7 +246,7 @@ public class DashboardController {
             @RequestParam(defaultValue = "today") String range,
             @RequestParam(required = false) String from,
             @RequestParam(required = false) String to,
-            @RequestParam(defaultValue = "true") boolean fullMobile) {
+            @RequestParam(defaultValue = "false") boolean fullMobile) {
         return ResponseEntity.ok(dashboardService.getShortlistedNoVisitAudience(range, from, to, fullMobile));
     }
 
@@ -256,7 +256,7 @@ public class DashboardController {
             @RequestParam(defaultValue = "today") String range,
             @RequestParam(required = false) String from,
             @RequestParam(required = false) String to,
-            @RequestParam(defaultValue = "true") boolean fullMobile) {
+            @RequestParam(defaultValue = "false") boolean fullMobile) {
         return ResponseEntity.ok(dashboardService.getStoreVisitBookedAudience(range, from, to, fullMobile));
     }
 
@@ -266,7 +266,7 @@ public class DashboardController {
             @RequestParam(defaultValue = "today") String range,
             @RequestParam(required = false) String from,
             @RequestParam(required = false) String to,
-            @RequestParam(defaultValue = "true") boolean fullMobile) {
+            @RequestParam(defaultValue = "false") boolean fullMobile) {
         return ResponseEntity.ok(dashboardService.getClickedBuyOnlineAudience(range, from, to, fullMobile));
     }
 
@@ -276,7 +276,7 @@ public class DashboardController {
             @RequestParam(defaultValue = "today") String range,
             @RequestParam(required = false) String from,
             @RequestParam(required = false) String to,
-            @RequestParam(defaultValue = "true") boolean fullMobile) {
+            @RequestParam(defaultValue = "false") boolean fullMobile) {
         return ResponseEntity.ok(dashboardService.getReferredConsentGivenAudience(range, from, to, fullMobile));
     }
 
@@ -286,7 +286,7 @@ public class DashboardController {
             @RequestParam(defaultValue = "today") String range,
             @RequestParam(required = false) String from,
             @RequestParam(required = false) String to,
-            @RequestParam(defaultValue = "true") boolean fullMobile) {
+            @RequestParam(defaultValue = "false") boolean fullMobile) {
         return ResponseEntity.ok(dashboardService.getOptedInNewArrivalsAudience(range, from, to, fullMobile));
     }
 }
