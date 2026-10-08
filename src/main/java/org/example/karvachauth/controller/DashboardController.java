@@ -9,7 +9,7 @@ import org.springframework.web.bind.annotation.*;
 import java.util.Map;
 
 /**
- * Dashboard APIs — Overview, Conversations, Store Visits and Referral Leads pages.
+ * Dashboard APIs — Overview, Conversations, Store Visits, Referral Leads and Audiences pages.
  *
  * flow  : all / celebrating / shopping / sparkle
  * range : today / 7d / 30d / custom   (custom needs from + to as yyyy-MM-dd, both inclusive)
@@ -101,7 +101,7 @@ public class DashboardController {
 
     /**
      * Rows to export, with the same filters as the table. The frontend builds the CSV / PDF.
-     * scope : page (the 50 rows of ?page=) / all (every row for the filters, up to 10,000)
+     * scope : page (the 50 rows of ?page=) / all (every row for the filters)
      */
     @GetMapping("/conversations/export")
     public ResponseEntity<Map<String, Object>> conversationsExport(
@@ -177,7 +177,7 @@ public class DashboardController {
 
     /**
      * Rows for "Copy as CSV" / export, with the same filters as the table. The frontend builds the file.
-     * scope : page (the 50 rows of ?page=) / all (every row for the filters, up to 10,000)
+     * scope : page (the 50 rows of ?page=) / all (every row for the filters)
      */
     @GetMapping("/referral-leads/export")
     public ResponseEntity<Map<String, Object>> referralLeadsExport(
@@ -189,5 +189,104 @@ public class DashboardController {
             @RequestParam(defaultValue = "all") String scope,
             @RequestParam(defaultValue = "0") int page) {
         return ResponseEntity.ok(dashboardService.exportReferralLeads(flow, range, from, to, show, scope, page));
+    }
+
+    // ==================================================================
+    // AUDIENCES PAGE — date range only, no path tabs
+    // ==================================================================
+
+    /** The 2 cards + "Where they stopped" + "Completed or opted in" (counts per segment). */
+    @GetMapping("/cohorts/summary")
+    public ResponseEntity<Map<String, Object>> cohortsSummary(
+            @RequestParam(defaultValue = "today") String range,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to) {
+        return ResponseEntity.ok(dashboardService.getAudiencesSummary(range, from, to));
+    }
+
+    /*
+     * One endpoint per card. Each returns the card's full count + the rows for its "Download CSV"
+     * (columns + all rows — the frontend builds the file).
+     * fullMobile : true = full numbers, false = masked (the "Full mobile numbers in downloads" checkbox)
+     */
+
+    /** Hint sent, no visit yet (I'm celebrating) */
+    @GetMapping("/cohorts/hint-sent-no-visit")
+    public ResponseEntity<Map<String, Object>> hintSentNoVisit(
+            @RequestParam(defaultValue = "today") String range,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(defaultValue = "true") boolean fullMobile) {
+        return ResponseEntity.ok(dashboardService.getHintSentNoVisitAudience(range, from, to, fullMobile));
+    }
+
+    /** List started, hint not sent (I'm celebrating) */
+    @GetMapping("/cohorts/list-started-no-hint")
+    public ResponseEntity<Map<String, Object>> listStartedNoHint(
+            @RequestParam(defaultValue = "today") String range,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(defaultValue = "true") boolean fullMobile) {
+        return ResponseEntity.ok(dashboardService.getListStartedNoHintAudience(range, from, to, fullMobile));
+    }
+
+    /** Browsing for her, no purchase (Shopping for her) */
+    @GetMapping("/cohorts/browsing-no-purchase")
+    public ResponseEntity<Map<String, Object>> browsingNoPurchase(
+            @RequestParam(defaultValue = "today") String range,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(defaultValue = "true") boolean fullMobile) {
+        return ResponseEntity.ok(dashboardService.getBrowsingNoPurchaseAudience(range, from, to, fullMobile));
+    }
+
+    /** Shortlisted for herself, no visit (Here for the sparkle) */
+    @GetMapping("/cohorts/shortlisted-no-visit")
+    public ResponseEntity<Map<String, Object>> shortlistedNoVisit(
+            @RequestParam(defaultValue = "today") String range,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(defaultValue = "true") boolean fullMobile) {
+        return ResponseEntity.ok(dashboardService.getShortlistedNoVisitAudience(range, from, to, fullMobile));
+    }
+
+    /** Store visit booked (all paths) */
+    @GetMapping("/cohorts/store-visit-booked")
+    public ResponseEntity<Map<String, Object>> storeVisitBooked(
+            @RequestParam(defaultValue = "today") String range,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(defaultValue = "true") boolean fullMobile) {
+        return ResponseEntity.ok(dashboardService.getStoreVisitBookedAudience(range, from, to, fullMobile));
+    }
+
+    /** Clicked Buy Online (Shopping for her) */
+    @GetMapping("/cohorts/clicked-buy-online")
+    public ResponseEntity<Map<String, Object>> clickedBuyOnline(
+            @RequestParam(defaultValue = "today") String range,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(defaultValue = "true") boolean fullMobile) {
+        return ResponseEntity.ok(dashboardService.getClickedBuyOnlineAudience(range, from, to, fullMobile));
+    }
+
+    /** Referred contacts, consent given (I'm celebrating + Shopping for her) */
+    @GetMapping("/cohorts/referred-consent-given")
+    public ResponseEntity<Map<String, Object>> referredConsentGiven(
+            @RequestParam(defaultValue = "today") String range,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(defaultValue = "true") boolean fullMobile) {
+        return ResponseEntity.ok(dashboardService.getReferredConsentGivenAudience(range, from, to, fullMobile));
+    }
+
+    /** Opted in for new arrivals (Here for the sparkle) */
+    @GetMapping("/cohorts/opted-in-new-arrivals")
+    public ResponseEntity<Map<String, Object>> optedInNewArrivals(
+            @RequestParam(defaultValue = "today") String range,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(defaultValue = "true") boolean fullMobile) {
+        return ResponseEntity.ok(dashboardService.getOptedInNewArrivalsAudience(range, from, to, fullMobile));
     }
 }

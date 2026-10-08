@@ -618,4 +618,179 @@ public interface DashboardRepository extends JpaRepository<Lead, Long> {
                                     @Param("path") String path,
                                     @Param("from") LocalDateTime from,
                                     @Param("to") LocalDateTime to);
+
+    // ==================================================================
+    // AUDIENCES PAGE — no path tabs, date range only
+    //
+    // "Where they stopped": one row per CUSTOMER — her latest journey (session with a path) started in the
+    // window, if it is still open (not CLOSED). Each customer lands in at most one segment, by her path and
+    // what she has / hasn't done:
+    //   HINT_SENT_NO_VISIT     Wife    — Ishara sent (HINT_SENT), then no tap on "Visit Store" / "Maybe later",
+    //                                    no store tap anywhere, no booking
+    //   LIST_STARTED_NO_HINT   Wife    — 1+ pieces on her list, no Ishara sent
+    //   BROWSING_NO_PURCHASE   Husband — reached the product carousel (2B), no "Buy Online" and no store tap
+    //   SHORTLISTED_NO_VISIT   Sparkle — 1+ pieces on her list, no store tap, no booking
+    //   OTHER                  — engaged, not finished, but not in one of the four (e.g. still choosing a category)
+    //
+    // "Completed or opted in": actions taken in the window (bookings / leads by created_at, closed journeys by
+    // closed_at).
+    // ==================================================================
+
+    /** A tap that heads to a store: "Visit nearby store" / "📍 Visit Store" or "Visit Store" on a product card. */
+    String STORE_TAP_ON_SESSION =
+            "EXISTS (SELECT 1 FROM messages tap WHERE tap.session_id = s.id AND tap.direction = 'INBOUND' " +
+                    "        AND (tap.button_payload = 'BTN_STORE_FINDER' OR LEFT(tap.button_payload, 6) = 'VISIT_'))";
+
+    String AUDIENCE_JOURNEYS =
+            "SELECT s.id AS sessionId, c.name AS customerName, s.phone AS phone, s.path AS path, " +
+                    "       s.current_step AS currentStep, s.selected_category AS category, s.selected_budget AS budget, " +
+                    "       (SELECT COUNT(*) FROM wishlist_items w WHERE w.session_id = s.id) AS piecesOnList, " +
+                    "       s.started_at AS startedAt, COALESCE(s.last_inbound_at, s.started_at) AS lastActivity, " +
+                    "       CASE " +
+                    "         WHEN s.path = 'WIFE' " +
+                    "              AND EXISTS (SELECT 1 FROM leads l WHERE l.session_id = s.id AND l.lead_type = 'HINT_SENT') " +
+                    "              AND NOT EXISTS (SELECT 1 FROM messages tap WHERE tap.session_id = s.id AND tap.direction = 'INBOUND' " +
+                    "                              AND tap.button_payload = 'W_MAYBE_LATER') " +
+                    "              AND NOT " + STORE_TAP_ON_SESSION +
+                    "              AND NOT EXISTS (SELECT 1 FROM bookings b WHERE b.session_id = s.id AND b.status <> 'CANCELLED') " +
+                    "           THEN 'HINT_SENT_NO_VISIT' " +
+                    "         WHEN s.path = 'WIFE' " +
+                    "              AND EXISTS (SELECT 1 FROM wishlist_items w WHERE w.session_id = s.id) " +
+                    "              AND NOT EXISTS (SELECT 1 FROM leads l WHERE l.session_id = s.id AND l.lead_type = 'HINT_SENT') " +
+                    "           THEN 'LIST_STARTED_NO_HINT' " +
+                    "         WHEN s.path = 'HUSBAND' " +
+                    "              AND EXISTS (SELECT 1 FROM messages seen WHERE seen.session_id = s.id AND seen.step = 'H_BROWSE_PRODUCTS') " +
+                    "              AND NOT EXISTS (SELECT 1 FROM messages tap WHERE tap.session_id = s.id AND tap.direction = 'INBOUND' " +
+                    "                              AND tap.button_payload = 'H_BUY_ONLINE') " +
+                    "              AND NOT " + STORE_TAP_ON_SESSION +
+                    "           THEN 'BROWSING_NO_PURCHASE' " +
+                    "         WHEN s.path = 'SPARKLE' " +
+                    "              AND EXISTS (SELECT 1 FROM wishlist_items w WHERE w.session_id = s.id) " +
+                    "              AND NOT " + STORE_TAP_ON_SESSION +
+                    "              AND NOT EXISTS (SELECT 1 FROM bookings b WHERE b.session_id = s.id AND b.status <> 'CANCELLED') " +
+                    "           THEN 'SHORTLISTED_NO_VISIT' " +
+                    "         ELSE 'OTHER' " +
+                    "       END AS segment " +
+                    "FROM sessions s " +
+                    "LEFT JOIN customers c ON c.id = s.customer_id " +
+                    "WHERE s.path IS NOT NULL " +
+                    "  AND s.is_active = TRUE AND s.current_step <> 'CLOSED' " +
+                    "  AND s.started_at >= :from AND s.started_at < :to " +
+                    "  AND s.id = (SELECT MAX(latest.id) FROM sessions latest " +
+                    "              WHERE latest.phone = s.phone AND latest.path IS NOT NULL " +
+                    "                AND latest.started_at >= :from AND latest.started_at < :to)";
+
+    interface SegmentCountProjection {
+        String getSegment();
+        Long getTotal();
+    }
+
+    /** Engaged-not-finished customers per segment (OTHER included, so the sum = "Engaged, Not Finished"). */
+    @Query(nativeQuery = true, value =
+            "SELECT journey.segment AS segment, COUNT(*) AS total " +
+                    "FROM (" + AUDIENCE_JOURNEYS + ") journey " +
+                    "GROUP BY journey.segment")
+    List<SegmentCountProjection> countAudienceSegments(@Param("from") LocalDateTime from,
+                                                       @Param("to") LocalDateTime to);
+
+    interface AudienceMemberProjection {
+        Long getSessionId();
+        String getCustomerName();
+        String getPhone();
+        String getPath();
+        String getCurrentStep();
+        String getCategory();
+        String getBudget();
+        Long getPiecesOnList();
+        LocalDateTime getStartedAt();
+        LocalDateTime getLastActivity();
+        String getSegment();
+    }
+
+    /** The customers in one "Where they stopped" segment — for its download. */
+    @Query(nativeQuery = true, value =
+            "SELECT journey.* FROM (" + AUDIENCE_JOURNEYS + ") journey " +
+                    "WHERE journey.segment = :segment " +
+                    "ORDER BY journey.lastActivity DESC " +
+                    "LIMIT :limit")
+    List<AudienceMemberProjection> findAudienceSegmentMembers(@Param("segment") String segment,
+                                                              @Param("from") LocalDateTime from,
+                                                              @Param("to") LocalDateTime to,
+                                                              @Param("limit") int limit);
+
+    // ---------- Completed or opted in ----------
+
+    /**
+     * Customers who took at least one of these actions in the window: finished a journey (E1),
+     * booked a store visit, tapped Buy Online, gave consent for a referred contact, or opted in (Sparkle).
+     */
+    @Query(nativeQuery = true, value =
+            "SELECT COUNT(DISTINCT action.phone) FROM ( " +
+                    "  SELECT s.phone AS phone FROM sessions s " +
+                    "  WHERE s.current_step = 'CLOSED' AND s.closed_at >= :from AND s.closed_at < :to " +
+                    "  UNION ALL " +
+                    "  SELECT b.phone FROM bookings b " +
+                    "  WHERE b.status <> 'CANCELLED' AND b.created_at >= :from AND b.created_at < :to " +
+                    "  UNION ALL " +
+                    "  SELECT l.phone FROM leads l " +
+                    "  WHERE ((l.lead_type IN ('HUSBAND_CAPTURED', 'WIFE_CAPTURED') AND l.consent = 'YES') " +
+                    "         OR l.lead_type IN ('BUY_ONLINE_CLICKED', 'SPARKLE_OPT_IN')) " +
+                    "    AND l.created_at >= :from AND l.created_at < :to " +
+                    ") action")
+    long countCompletedOrOptedInCustomers(@Param("from") LocalDateTime from,
+                                          @Param("to") LocalDateTime to);
+
+    /** Customers with a confirmed (not cancelled) store visit booked in the window — any path. */
+    @Query(nativeQuery = true, value =
+            "SELECT COUNT(DISTINCT b.phone) FROM bookings b " +
+                    "WHERE b.status <> 'CANCELLED' AND b.created_at >= :from AND b.created_at < :to")
+    long countCustomersWithBooking(@Param("from") LocalDateTime from,
+                                   @Param("to") LocalDateTime to);
+
+    /** Customers with a lead of one of these types in the window (consentYesOnly = consent 'YES' rows only). */
+    @Query(nativeQuery = true, value =
+            "SELECT COUNT(DISTINCT l.phone) FROM leads l " +
+                    "WHERE l.lead_type IN (:leadTypes) " +
+                    "  AND (:consentYesOnly = FALSE OR l.consent = 'YES') " +
+                    "  AND l.created_at >= :from AND l.created_at < :to")
+    long countCustomersWithLead(@Param("leadTypes") List<String> leadTypes,
+                                @Param("consentYesOnly") boolean consentYesOnly,
+                                @Param("from") LocalDateTime from,
+                                @Param("to") LocalDateTime to);
+
+    interface AudienceLeadRowProjection {
+        String getCustomerName();
+        String getPhone();
+        String getPath();
+        String getLeadType();
+        String getProductSkus();
+        String getProductName();         // when exactly one SKU
+        String getPartnerName();
+        String getPartnerPhone();
+        LocalDate getPartnerDate();
+        String getPartnerDateType();
+        String getConsent();
+        LocalDateTime getCreatedAt();
+    }
+
+    /** Lead rows for a "Completed or opted in" download (Buy Online / referred contacts / opt-ins). */
+    @Query(nativeQuery = true, value =
+            "SELECT COALESCE(l.customer_name, c.name) AS customerName, l.phone AS phone, l.path AS path, " +
+                    "       l.lead_type AS leadType, l.product_skus AS productSkus, p.name AS productName, " +
+                    "       l.partner_name AS partnerName, l.partner_phone AS partnerPhone, " +
+                    "       l.partner_date AS partnerDate, l.partner_date_type AS partnerDateType, " +
+                    "       l.consent AS consent, l.created_at AS createdAt " +
+                    "FROM leads l " +
+                    "LEFT JOIN customers c ON c.phone = l.phone " +
+                    "LEFT JOIN products p ON p.sku = l.product_skus " +
+                    "WHERE l.lead_type IN (:leadTypes) " +
+                    "  AND (:consentYesOnly = FALSE OR l.consent = 'YES') " +
+                    "  AND l.created_at >= :from AND l.created_at < :to " +
+                    "ORDER BY l.created_at DESC " +
+                    "LIMIT :limit")
+    List<AudienceLeadRowProjection> findAudienceLeadRows(@Param("leadTypes") List<String> leadTypes,
+                                                         @Param("consentYesOnly") boolean consentYesOnly,
+                                                         @Param("from") LocalDateTime from,
+                                                         @Param("to") LocalDateTime to,
+                                                         @Param("limit") int limit);
 }

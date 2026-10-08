@@ -510,7 +510,8 @@ public class DashboardServiceImple implements DashboardService {
     // ==================================================================
 
     private static final int CONVERSATIONS_PAGE_SIZE = 50;
-    private static final int MAX_EXPORT_ROWS = 10_000;
+    /** "Export all" has no row limit — the queries share LIMIT with the paged tables, so this means every row. */
+    private static final int ALL_ROWS = Integer.MAX_VALUE;
     /** IN (:steps) can't be an empty list; this placeholder is ignored when filterByStep = false. */
     private static final List<String> NO_STEP_FILTER = List.of("-");
     private static final int MAX_SEARCH_LENGTH = 50;
@@ -724,7 +725,7 @@ public class DashboardServiceImple implements DashboardService {
     /**
      * The rows to export — the frontend turns them into CSV / PDF.
      * scope = "page" → the 50 rows of that page; scope = "all" → every row for the filters,
-     * up to MAX_EXPORT_ROWS (truncated = true when there were more).
+     * no row limit.
      */
     @Override
     public Map<String, Object> exportConversations(ConversationFilters filters, String scope, int page) {
@@ -740,7 +741,7 @@ public class DashboardServiceImple implements DashboardService {
         long totalElements = countConversations(query);
         List<DashboardRepository.ConversationRowProjection> rows = currentPageOnly
                 ? findConversations(query, CONVERSATIONS_PAGE_SIZE, safePage * CONVERSATIONS_PAGE_SIZE)
-                : findConversations(query, MAX_EXPORT_ROWS, 0);
+                : findConversations(query, ALL_ROWS, 0);
 
         LocalDateTime now = LocalDateTime.now();
         List<Map<String, String>> exportRows = new ArrayList<>();
@@ -748,10 +749,6 @@ public class DashboardServiceImple implements DashboardService {
             exportRows.add(toExportRow(row, now, showBudget));
         }
 
-        boolean truncated = !currentPageOnly && totalElements > MAX_EXPORT_ROWS;
-        if (truncated) {
-            log.warn("stage=CONVERSATIONS_EXPORT_TRUNCATED total={} exported={}", totalElements, MAX_EXPORT_ROWS);
-        }
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("columns", showBudget
@@ -763,7 +760,6 @@ public class DashboardServiceImple implements DashboardService {
         result.put("totalElements", totalElements);
         result.put("totalPages", totalPages(totalElements));
         result.put("exportedRows", exportRows.size());
-        result.put("truncated", truncated);
         result.put("flow", normaliseFlow(filters.flow()));
         result.put("range", normaliseRange(filters.range()));
         return result;
@@ -1205,7 +1201,7 @@ public class DashboardServiceImple implements DashboardService {
         long totalElements = countReferralRows(showFilter, pathType, window);
         List<DashboardRepository.ReferralLeadRowProjection> rows = currentPageOnly
                 ? findReferralRows(showFilter, pathType, window, REFERRAL_PAGE_SIZE, safePage * REFERRAL_PAGE_SIZE)
-                : findReferralRows(showFilter, pathType, window, MAX_EXPORT_ROWS, 0);
+                : findReferralRows(showFilter, pathType, window, ALL_ROWS, 0);
 
         List<Map<String, String>> exportRows = new ArrayList<>();
         for (DashboardRepository.ReferralLeadRowProjection row : rows) {
@@ -1222,10 +1218,6 @@ public class DashboardServiceImple implements DashboardService {
             exportRows.add(exportRow);
         }
 
-        boolean truncated = !currentPageOnly && totalElements > MAX_EXPORT_ROWS;
-        if (truncated) {
-            log.warn("stage=REFERRAL_EXPORT_TRUNCATED total={} exported={}", totalElements, MAX_EXPORT_ROWS);
-        }
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("columns", REFERRAL_EXPORT_COLUMNS);
@@ -1234,7 +1226,6 @@ public class DashboardServiceImple implements DashboardService {
         result.put("page", safePage);
         result.put("totalElements", totalElements);
         result.put("exportedRows", exportRows.size());
-        result.put("truncated", truncated);
         result.put("show", showFilter);
         result.put("flow", normaliseFlow(flow));
         result.put("range", normaliseRange(range));
@@ -1332,6 +1323,283 @@ public class DashboardServiceImple implements DashboardService {
     private long pctWhole(long part, long total) {
         if (total <= 0) return 0L;
         return Math.round((part * 100.0) / total);
+    }
+
+    // ==================================================================
+    // AUDIENCES PAGE — date range only (no path tabs)
+    //
+    //   Engaged, Not Finished : customers whose latest journey started in the range is still open
+    //   Where they stopped    : 4 segments of those customers — each customer in one at most
+    //   Completed or opted in : customers who took an action in the range (finished, booked, bought online,
+    //                           gave consent, opted in) + one card per action
+    // Every segment has a download (rows for CSV); fullMobile = the "Full mobile numbers in downloads" box.
+    // ==================================================================
+
+    /** A segment on the page: URL key → DB value / label / paths / priority. */
+    private record AudienceSegment(String key, String dbValue, String label, List<String> flows, Integer priority) {
+    }
+
+    private static final List<AudienceSegment> STOPPED_SEGMENTS = List.of(
+            new AudienceSegment("hint-sent-no-visit", "HINT_SENT_NO_VISIT", "Hint sent, no visit yet",
+                    List.of("celebrating"), 1),
+            new AudienceSegment("list-started-no-hint", "LIST_STARTED_NO_HINT", "List started, hint not sent",
+                    List.of("celebrating"), 2),
+            new AudienceSegment("browsing-no-purchase", "BROWSING_NO_PURCHASE", "Browsing for her, no purchase",
+                    List.of("shopping"), 3),
+            new AudienceSegment("shortlisted-no-visit", "SHORTLISTED_NO_VISIT", "Shortlisted for herself, no visit",
+                    List.of("sparkle"), 3));
+
+    private static final List<AudienceSegment> COMPLETED_SEGMENTS = List.of(
+            new AudienceSegment("store-visit-booked", null, "Store visit booked",
+                    List.of("celebrating", "shopping", "sparkle"), null),
+            new AudienceSegment("clicked-buy-online", null, "Clicked Buy Online", List.of("shopping"), null),
+            new AudienceSegment("referred-consent-given", null, "Referred contacts, consent given",
+                    List.of("celebrating", "shopping"), null),
+            new AudienceSegment("opted-in-new-arrivals", null, "Opted in for new arrivals", List.of("sparkle"), null));
+
+    @Override
+    public Map<String, Object> getAudiencesSummary(String range, String startDate, String endDate) {
+        DateWindow window = resolveDateTimeRange(range, startDate, endDate);
+        LocalDateTime from = window.from();
+        LocalDateTime to = window.to();
+
+        // Where they stopped (+ OTHER, so the total = Engaged, Not Finished)
+        Map<String, Long> countBySegment = new HashMap<>();
+        for (DashboardRepository.SegmentCountProjection row : dashboardRepo.countAudienceSegments(from, to)) {
+            countBySegment.put(row.getSegment(), valueOrZero(row.getTotal()));
+        }
+        long engagedNotFinished = countBySegment.values().stream().mapToLong(Long::longValue).sum();
+
+        List<Map<String, Object>> stopped = new ArrayList<>();
+        long stoppedTotal = 0;
+        for (AudienceSegment segment : STOPPED_SEGMENTS) {
+            long count = countBySegment.getOrDefault(segment.dbValue(), 0L);
+            stoppedTotal += count;
+            stopped.add(audienceCard(segment, count));
+        }
+
+        // Completed or opted in
+        List<Map<String, Object>> completed = new ArrayList<>();
+        completed.add(audienceCard(COMPLETED_SEGMENTS.get(0), dashboardRepo.countCustomersWithBooking(from, to)));
+        completed.add(audienceCard(COMPLETED_SEGMENTS.get(1),
+                dashboardRepo.countCustomersWithLead(List.of(LEAD_BUY_ONLINE_CLICKED), false, from, to)));
+        completed.add(audienceCard(COMPLETED_SEGMENTS.get(2),
+                dashboardRepo.countCustomersWithLead(ALL_REFERRAL_TYPES, true, from, to)));
+        completed.add(audienceCard(COMPLETED_SEGMENTS.get(3),
+                dashboardRepo.countCustomersWithLead(List.of(LEAD_SPARKLE_OPT_IN), false, from, to)));
+        long completedOrOptedIn = dashboardRepo.countCompletedOrOptedInCustomers(from, to);
+
+        Map<String, Object> whereTheyStopped = new LinkedHashMap<>();
+        whereTheyStopped.put("total", stoppedTotal);
+        whereTheyStopped.put("segments", stopped);
+
+        Map<String, Object> completedOrOptedInSection = new LinkedHashMap<>();
+        completedOrOptedInSection.put("total", completedOrOptedIn);
+        completedOrOptedInSection.put("segments", completed);
+
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("engagedNotFinished", engagedNotFinished);
+        data.put("completedOrOptedIn", completedOrOptedIn);
+        data.put("whereTheyStopped", whereTheyStopped);
+        data.put("completedOrOptedInSegments", completedOrOptedInSection);
+        data.put("range", normaliseRange(range));
+        return data;
+    }
+
+    private Map<String, Object> audienceCard(AudienceSegment segment, long count) {
+        Map<String, Object> card = new LinkedHashMap<>();
+        card.put("key", segment.key());
+        card.put("label", segment.label());
+        card.put("flows", segment.flows());
+        card.put("priority", segment.priority());
+        card.put("count", count);
+        return card;
+    }
+
+    // ---------- one endpoint per card: its full count + the rows for its "Download CSV" ----------
+
+    @Override
+    public Map<String, Object> getHintSentNoVisitAudience(String range, String startDate, String endDate, boolean fullMobile) {
+        return buildAudienceCardData("hint-sent-no-visit", range, startDate, endDate, fullMobile);
+    }
+
+    @Override
+    public Map<String, Object> getListStartedNoHintAudience(String range, String startDate, String endDate, boolean fullMobile) {
+        return buildAudienceCardData("list-started-no-hint", range, startDate, endDate, fullMobile);
+    }
+
+    @Override
+    public Map<String, Object> getBrowsingNoPurchaseAudience(String range, String startDate, String endDate, boolean fullMobile) {
+        return buildAudienceCardData("browsing-no-purchase", range, startDate, endDate, fullMobile);
+    }
+
+    @Override
+    public Map<String, Object> getShortlistedNoVisitAudience(String range, String startDate, String endDate, boolean fullMobile) {
+        return buildAudienceCardData("shortlisted-no-visit", range, startDate, endDate, fullMobile);
+    }
+
+    @Override
+    public Map<String, Object> getStoreVisitBookedAudience(String range, String startDate, String endDate, boolean fullMobile) {
+        return buildAudienceCardData("store-visit-booked", range, startDate, endDate, fullMobile);
+    }
+
+    @Override
+    public Map<String, Object> getClickedBuyOnlineAudience(String range, String startDate, String endDate, boolean fullMobile) {
+        return buildAudienceCardData("clicked-buy-online", range, startDate, endDate, fullMobile);
+    }
+
+    @Override
+    public Map<String, Object> getReferredConsentGivenAudience(String range, String startDate, String endDate, boolean fullMobile) {
+        return buildAudienceCardData("referred-consent-given", range, startDate, endDate, fullMobile);
+    }
+
+    @Override
+    public Map<String, Object> getOptedInNewArrivalsAudience(String range, String startDate, String endDate, boolean fullMobile) {
+        return buildAudienceCardData("opted-in-new-arrivals", range, startDate, endDate, fullMobile);
+    }
+
+    /** The full (uncapped) count of one card — the same number the summary shows. */
+    private long audienceCardCount(AudienceSegment segment, LocalDateTime from, LocalDateTime to) {
+        if (segment.dbValue() != null) {
+            return dashboardRepo.countAudienceSegments(from, to).stream()
+                    .filter(row -> segment.dbValue().equals(row.getSegment()))
+                    .mapToLong(row -> valueOrZero(row.getTotal()))
+                    .sum();
+        }
+        return switch (segment.key()) {
+            case "store-visit-booked" -> dashboardRepo.countCustomersWithBooking(from, to);
+            case "clicked-buy-online" -> dashboardRepo.countCustomersWithLead(List.of(LEAD_BUY_ONLINE_CLICKED), false, from, to);
+            case "referred-consent-given" -> dashboardRepo.countCustomersWithLead(ALL_REFERRAL_TYPES, true, from, to);
+            default -> dashboardRepo.countCustomersWithLead(List.of(LEAD_SPARKLE_OPT_IN), false, from, to);
+        };
+    }
+
+    /**
+     * One card: its full count + all the rows for its "Download CSV" — the frontend builds the file.
+     * fullMobile = true → "+91 98765 43210"; false → "+91 98765 ••210" (the checkbox on the page).
+     */
+    private Map<String, Object> buildAudienceCardData(String segmentKey, String range, String startDate, String endDate,
+                                                      boolean fullMobile) {
+        DateWindow window = resolveDateTimeRange(range, startDate, endDate);
+        LocalDateTime from = window.from();
+        LocalDateTime to = window.to();
+        String key = segmentKey == null ? "" : segmentKey.trim().toLowerCase();
+
+        List<String> columns;
+        List<Map<String, String>> rows = new ArrayList<>();
+
+        AudienceSegment stoppedSegment = STOPPED_SEGMENTS.stream()
+                .filter(segment -> segment.key().equals(key)).findFirst().orElse(null);
+        AudienceSegment completedSegment = COMPLETED_SEGMENTS.stream()
+                .filter(segment -> segment.key().equals(key)).findFirst().orElse(null);
+
+        if (stoppedSegment != null) {
+            columns = List.of("Customer", "Mobile", "Path", "Step", "Category", "Budget", "Pieces on List",
+                    "Started At", "Last Activity");
+            for (DashboardRepository.AudienceMemberProjection member : dashboardRepo.findAudienceSegmentMembers(
+                    stoppedSegment.dbValue(), from, to, ALL_ROWS)) {
+                ScriptStep step = SCRIPT_STEP_BY_BOT_STEP.get(member.getCurrentStep());
+                Map<String, String> row = new LinkedHashMap<>();
+                row.put("Customer", textOrEmpty(member.getCustomerName()));
+                row.put("Mobile", exportPhone(member.getPhone(), fullMobile));
+                row.put("Path", pathLabel(member.getPath()));
+                row.put("Step", step == null ? textOrEmpty(member.getCurrentStep()) : step.code() + " · " + step.label());
+                row.put("Category", textOrEmpty(CATEGORY_LABELS.get(member.getCategory())));
+                row.put("Budget", textOrEmpty(BUDGET_LABELS.get(member.getBudget())));
+                row.put("Pieces on List", String.valueOf(valueOrZero(member.getPiecesOnList())));
+                row.put("Started At", formatExportTime(member.getStartedAt()));
+                row.put("Last Activity", formatExportTime(member.getLastActivity()));
+                rows.add(row);
+            }
+        } else if (completedSegment != null && key.equals("store-visit-booked")) {
+            columns = List.of("Customer", "Mobile", "Path", "Boutique", "Slot", "Reserved", "Booking Ref", "Booked At");
+            for (DashboardRepository.BookingRowProjection booking : dashboardRepo.findBookingsPage(
+                    null, from, to, ALL_ROWS, 0)) {
+                List<String> reservedSkus = booking.getReservedSkus() == null ? List.of()
+                        : Arrays.stream(booking.getReservedSkus().split(",")).map(String::trim).filter(this::hasText).toList();
+                Map<String, String> row = new LinkedHashMap<>();
+                row.put("Customer", textOrEmpty(booking.getCustomerName()));
+                row.put("Mobile", exportPhone(booking.getPhone(), fullMobile));
+                row.put("Path", pathLabel(booking.getPath()));
+                row.put("Boutique", textOrEmpty(booking.getStoreName()));
+                row.put("Slot", textOrEmpty(slotLabel(booking.getVisitDate(), booking.getTimeSlot())));
+                row.put("Reserved", textOrEmpty(reservedLabel(reservedSkus, booking.getReservedProductName())));
+                row.put("Booking Ref", textOrEmpty(booking.getBookingRef()));
+                row.put("Booked At", formatExportTime(booking.getBookedAt()));
+                rows.add(row);
+            }
+        } else if (completedSegment != null && key.equals("clicked-buy-online")) {
+            columns = List.of("Customer", "Mobile", "Path", "Product", "SKU", "Clicked At");
+            for (DashboardRepository.AudienceLeadRowProjection lead : dashboardRepo.findAudienceLeadRows(
+                    List.of(LEAD_BUY_ONLINE_CLICKED), false, from, to, ALL_ROWS)) {
+                Map<String, String> row = new LinkedHashMap<>();
+                row.put("Customer", textOrEmpty(lead.getCustomerName()));
+                row.put("Mobile", exportPhone(lead.getPhone(), fullMobile));
+                row.put("Path", pathLabel(lead.getPath()));
+                row.put("Product", textOrEmpty(lead.getProductName()));
+                row.put("SKU", textOrEmpty(lead.getProductSkus()));
+                row.put("Clicked At", formatExportTime(lead.getCreatedAt()));
+                rows.add(row);
+            }
+        } else if (completedSegment != null && key.equals("referred-consent-given")) {
+            columns = List.of("Referred By", "Mobile", "Path", "Referred Contact", "Relation", "Contact Mobile",
+                    "Key Date", "Consent", "Captured At");
+            for (DashboardRepository.AudienceLeadRowProjection lead : dashboardRepo.findAudienceLeadRows(
+                    ALL_REFERRAL_TYPES, true, from, to, ALL_ROWS)) {
+                Map<String, String> row = new LinkedHashMap<>();
+                row.put("Referred By", textOrEmpty(lead.getCustomerName()));
+                row.put("Mobile", exportPhone(lead.getPhone(), fullMobile));
+                row.put("Path", pathLabel(lead.getPath()));
+                row.put("Referred Contact", textOrEmpty(lead.getPartnerName()));
+                row.put("Relation", relationLabel(lead.getLeadType()));
+                row.put("Contact Mobile", exportPhone(lead.getPartnerPhone(), fullMobile));
+                row.put("Key Date", keyDateLabel(lead.getPartnerDateType(), lead.getPartnerDate()));
+                row.put("Consent", consentLabel(lead.getConsent()));
+                row.put("Captured At", formatExportTime(lead.getCreatedAt()));
+                rows.add(row);
+            }
+        } else if (completedSegment != null && key.equals("opted-in-new-arrivals")) {
+            columns = List.of("Customer", "Mobile", "Path", "Opted In At");
+            for (DashboardRepository.AudienceLeadRowProjection lead : dashboardRepo.findAudienceLeadRows(
+                    List.of(LEAD_SPARKLE_OPT_IN), false, from, to, ALL_ROWS)) {
+                Map<String, String> row = new LinkedHashMap<>();
+                row.put("Customer", textOrEmpty(lead.getCustomerName()));
+                row.put("Mobile", exportPhone(lead.getPhone(), fullMobile));
+                row.put("Path", pathLabel(lead.getPath()));
+                row.put("Opted In At", formatExportTime(lead.getCreatedAt()));
+                rows.add(row);
+            }
+        } else {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "segment must be one of "
+                    + STOPPED_SEGMENTS.stream().map(AudienceSegment::key).toList() + " or "
+                    + COMPLETED_SEGMENTS.stream().map(AudienceSegment::key).toList());
+        }
+
+        AudienceSegment segment = stoppedSegment != null ? stoppedSegment : completedSegment;
+        long totalCount = audienceCardCount(segment, from, to);
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("segment", segment.key());
+        result.put("label", segment.label());
+        result.put("flows", segment.flows());
+        result.put("priority", segment.priority());
+        result.put("count", totalCount);                       // full count of the card, never capped
+        result.put("columns", columns);
+        result.put("rows", rows);
+        result.put("exportedRows", rows.size());
+        result.put("fullMobile", fullMobile);
+        result.put("range", normaliseRange(range));
+        return result;
+    }
+
+    /** Full number, or masked like the tables — the "Full mobile numbers in downloads" checkbox. */
+    private String exportPhone(String phone, boolean fullMobile) {
+        if (!hasText(phone)) return "";
+        return fullMobile ? formatPhone(phone) : maskPhone(phone);
+    }
+
+    private String formatExportTime(LocalDateTime time) {
+        return time == null ? "" : time.format(EXPORT_DATE_TIME);
     }
 
     // ==================================================================

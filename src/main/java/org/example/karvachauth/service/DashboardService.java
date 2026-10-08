@@ -41,6 +41,29 @@ public interface DashboardService {
     Map<String, Object> exportReferralLeads(String flow, String range, String startDate, String endDate,
                                             String show, String scope, int page);
 
+    // ---------------- Audiences page (date range only, no path tabs) ----------------
+
+    Map<String, Object> getAudiencesSummary(String range, String startDate, String endDate);
+
+    // One per card: the card's full count + the rows for its download.
+    // fullMobile = "Full mobile numbers in downloads" (true = full numbers, false = masked).
+
+    Map<String, Object> getHintSentNoVisitAudience(String range, String startDate, String endDate, boolean fullMobile);
+
+    Map<String, Object> getListStartedNoHintAudience(String range, String startDate, String endDate, boolean fullMobile);
+
+    Map<String, Object> getBrowsingNoPurchaseAudience(String range, String startDate, String endDate, boolean fullMobile);
+
+    Map<String, Object> getShortlistedNoVisitAudience(String range, String startDate, String endDate, boolean fullMobile);
+
+    Map<String, Object> getStoreVisitBookedAudience(String range, String startDate, String endDate, boolean fullMobile);
+
+    Map<String, Object> getClickedBuyOnlineAudience(String range, String startDate, String endDate, boolean fullMobile);
+
+    Map<String, Object> getReferredConsentGivenAudience(String range, String startDate, String endDate, boolean fullMobile);
+
+    Map<String, Object> getOptedInNewArrivalsAudience(String range, String startDate, String endDate, boolean fullMobile);
+
     /**
      * Every filter on the Conversations page — the controller builds it from the request params.
      *
