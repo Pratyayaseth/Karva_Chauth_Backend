@@ -2,13 +2,14 @@ package org.example.karvachauth.controller;
 
 import lombok.RequiredArgsConstructor;
 import org.example.karvachauth.service.DashboardService;
+import org.example.karvachauth.service.DashboardService.ConversationFilters;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.Map;
 
 /**
- * Overview page APIs.
+ * Dashboard APIs — Overview, Conversations and Store Visits pages.
  *
  * flow  : all / celebrating / shopping / sparkle
  * range : today / 7d / 30d / custom   (custom needs from + to as yyyy-MM-dd, both inclusive)
@@ -64,5 +65,84 @@ public class DashboardController {
             @RequestParam(required = false) String from,
             @RequestParam(required = false) String to) {
         return ResponseEntity.ok(dashboardService.getPathsSummary(range, from, to));
+    }
+
+    // ==================================================================
+    // CONVERSATIONS PAGE
+    // ==================================================================
+
+    /** The 5 cards at the top — follow the path tabs and the date range only. */
+    @GetMapping("/conversations/summary")
+    public ResponseEntity<Map<String, Object>> conversationsSummary(
+            @RequestParam(defaultValue = "all") String flow,
+            @RequestParam(defaultValue = "today") String range,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to) {
+        return ResponseEntity.ok(dashboardService.getConversationsSummary(flow, range, from, to));
+    }
+
+    /** The table — 50 rows per page, page starts at 0. Every filter is optional. */
+    @GetMapping("/conversations")
+    public ResponseEntity<Map<String, Object>> conversations(
+            @RequestParam(defaultValue = "all") String flow,
+            @RequestParam(defaultValue = "today") String range,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(required = false) String category,
+            @RequestParam(required = false) String step,
+            @RequestParam(required = false) String search,
+            @RequestParam(defaultValue = "lastActivity") String sort,
+            @RequestParam(defaultValue = "desc") String direction,
+            @RequestParam(defaultValue = "0") int page) {
+        ConversationFilters filters = new ConversationFilters(
+                flow, range, from, to, category, step, search, sort, direction);
+        return ResponseEntity.ok(dashboardService.getConversations(filters, page));
+    }
+
+    /**
+     * Rows to export, with the same filters as the table. The frontend builds the CSV / PDF.
+     * scope : page (the 50 rows of ?page=) / all (every row for the filters, up to 10,000)
+     */
+    @GetMapping("/conversations/export")
+    public ResponseEntity<Map<String, Object>> conversationsExport(
+            @RequestParam(defaultValue = "all") String flow,
+            @RequestParam(defaultValue = "today") String range,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(required = false) String category,
+            @RequestParam(required = false) String step,
+            @RequestParam(required = false) String search,
+            @RequestParam(defaultValue = "lastActivity") String sort,
+            @RequestParam(defaultValue = "desc") String direction,
+            @RequestParam(defaultValue = "all") String scope,
+            @RequestParam(defaultValue = "0") int page) {
+        ConversationFilters filters = new ConversationFilters(
+                flow, range, from, to, category, step, search, sort, direction);
+        return ResponseEntity.ok(dashboardService.exportConversations(filters, scope, page));
+    }
+
+    // ==================================================================
+    // STORE VISITS PAGE
+    // ==================================================================
+
+    /** The 3 cards — Visits Booked, Booking Form Opened, Most Picked Slot. */
+    @GetMapping("/store-visits/summary")
+    public ResponseEntity<Map<String, Object>> storeVisitsSummary(
+            @RequestParam(defaultValue = "all") String flow,
+            @RequestParam(defaultValue = "today") String range,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to) {
+        return ResponseEntity.ok(dashboardService.getStoreVisitsSummary(flow, range, from, to));
+    }
+
+    /** Recent Bookings table — newest first, 50 rows per page, page starts at 0. */
+    @GetMapping("/store-visits/bookings")
+    public ResponseEntity<Map<String, Object>> storeBookings(
+            @RequestParam(defaultValue = "all") String flow,
+            @RequestParam(defaultValue = "today") String range,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(defaultValue = "0") int page) {
+        return ResponseEntity.ok(dashboardService.getStoreBookings(flow, range, from, to, page));
     }
 }

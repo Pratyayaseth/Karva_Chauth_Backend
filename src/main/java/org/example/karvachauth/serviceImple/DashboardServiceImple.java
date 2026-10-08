@@ -4,6 +4,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.example.karvachauth.repository.DashboardRepository;
 import org.example.karvachauth.service.DashboardService;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
@@ -29,6 +30,10 @@ import static org.example.karvachauth.constants.KarvaChauthConstants.*;
 public class DashboardServiceImple implements DashboardService {
 
     private final DashboardRepository dashboardRepo;
+
+    /** Same setting as the bot's idle nudge — a conversation quiet for longer than this shows as "Idle". */
+    @Value("${karvachauth.idle.minutes:60}")
+    private long idleMinutes;
 
     private static final DateTimeFormatter ISO_DATE = DateTimeFormatter.ISO_LOCAL_DATE;
     private static final DateTimeFormatter DAY_MONTH = DateTimeFormatter.ofPattern("d MMM", Locale.ENGLISH);
@@ -496,6 +501,599 @@ public class DashboardServiceImple implements DashboardService {
         card.put("openerTaps", openerTaps);
         card.put("share", pct(openerTaps, totalOpenerTaps));
         return card;
+    }
+
+    // ==================================================================
+    // CONVERSATIONS PAGE
+    // Rows are the sessions STARTED in the window that she began by tapping a Step 0 button —
+    // the same sessions as "Opener" on the Overview funnel. A template she never tapped isn't shown.
+    // ==================================================================
+
+    private static final int CONVERSATIONS_PAGE_SIZE = 50;
+    private static final int MAX_EXPORT_ROWS = 10_000;
+    /** IN (:steps) can't be an empty list; this placeholder is ignored when filterByStep = false. */
+    private static final List<String> NO_STEP_FILTER = List.of("-");
+    private static final int MAX_SEARCH_LENGTH = 50;
+    private static final DateTimeFormatter EXPORT_DATE_TIME = DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm");
+
+    /** Export columns, in order. "Budget" is dropped on the "I'm celebrating" path (see budgetShownFor). */
+    private static final List<String> EXPORT_COLUMNS = List.of(
+            "Customer", "Phone", "Path", "Step", "Status", "Category", "Budget", "Started At", "Last Activity");
+
+    /** Column header → value the repository sorts on (see CONVERSATION_SORT_VALUE). */
+    private static final Map<String, String> SORT_COLUMNS = Map.of(
+            "customer", "customer",
+            "phone", "phone",
+            "path", "path",
+            "step", "step",
+            "category", "category",
+            "budget", "budget",
+            "lastactivity", "lastActivity");
+
+    private static final Map<String, String> CATEGORY_LABELS = orderedMap(
+            CAT_PENDANTS, "Pendants",
+            CAT_MIA_SUTRA, "Mia Sutra",
+            CAT_PENDANT_CHAIN, "Pendant & Chain",
+            CAT_NECKLACES, "Necklaces",
+            CAT_EARRINGS, "Earrings",
+            CAT_RINGS, "Rings",
+            CAT_BRACELETS_BANGLES, "Bracelets & Bangles");
+
+    private static final Map<String, String> BUDGET_LABELS = orderedMap(
+            BUDGET_UNDER_50K, "Under ₹50,000",
+            BUDGET_50_100K, "₹50,000 – ₹1,00,000",
+            BUDGET_100_200K, "₹1,00,000 – ₹2,00,000",
+            BUDGET_ABOVE_200K, "Above ₹2,00,000");
+
+    /**
+     * The flow script's step codes — the same codes as the frontend's Step filter and the
+     * comments in KarvaChauthConstants (W_PICK_CATEGORY //1A, H_BUDGET //2A-BUDGET, …).
+     * Nothing in the bot changes: this only maps the bot's step values to the script codes.
+     *
+     * The Wife and Sparkle journeys share codes (1A, 1B, 1C, 1D, 1I), so filtering by "1A"
+     * matches both; the path filter narrows it down. Labels can differ per path
+     * (1I is "Reminder Offer" for the Wife, "Keep Me Posted" for Sparkle).
+     *
+     *   0  · Opener — tapped a Step 0 button, but not yet "Choose my gift" / "Find her a gift" / "Show me".
+     *   C2 · Store Visit — tapped "Visit nearby store" (the booking form is sent here once it's built).
+     *   E1 · Closed — finished journeys (current step CLOSED). A finished row still shows the
+     *                 step it ended on (e.g. 1K · Consent), with status "Completed".
+     *
+     * When the bot gets a new step, add it here (and to the sort order in CONVERSATION_SORT_VALUE).
+     */
+    private record ScriptStep(String code, String label, List<String> steps) {
+    }
+
+    private static final List<ScriptStep> SCRIPT_STEPS = List.of(
+            new ScriptStep("0", "Opener", List.of(STEP_OPENER)),
+            // I'm celebrating (Wife)
+            new ScriptStep("1", "Choose My Gift", List.of(STEP_W_CHOOSE_MY_GIFT)),
+            new ScriptStep("1A", "Category", List.of(STEP_W_PICK_CATEGORY)),
+            new ScriptStep("1B", "Carousel", List.of(STEP_W_BROWSE_PRODUCTS)),
+            new ScriptStep("1C", "Added to List", List.of(STEP_W_ADDED_TO_LIST)),
+            new ScriptStep("1D", "Adding More", List.of(STEP_W_ADD_MORE)),
+            new ScriptStep("1G", "Ishara Created", List.of(STEP_W_HINT_READY)),
+            new ScriptStep("1H", "Ishara Sent", List.of(STEP_W_STORE_INVITE)),
+            new ScriptStep("1I", "Reminder Offer", List.of(STEP_W_REINFORCE)),
+            new ScriptStep("1I-nudge", "Reminder Nudge", List.of(STEP_W_REINFORCE_NUDGE)),
+            new ScriptStep("1J", "His Details", List.of(STEP_W_CAPH_NAME, STEP_W_CAPH_ANNIVERSARY, STEP_W_CAPH_MOBILE)),
+            new ScriptStep("1K", "Consent", List.of(STEP_W_CONSENT)),
+            // Shopping for her (Husband)
+            new ScriptStep("2", "Find Her a Gift", List.of(STEP_H_FIND_HER_GIFT)),
+            new ScriptStep("2A", "Category", List.of(STEP_H_PICK_CATEGORY)),
+            new ScriptStep("2A-Budget", "Budget", List.of(STEP_H_BUDGET)),
+            new ScriptStep("2B", "Carousel", List.of(STEP_H_BROWSE_PRODUCTS)),
+            new ScriptStep("2C", "Buy / Visit", List.of(STEP_H_CONFIRM_CHOICE)),
+            new ScriptStep("2E", "Her Details Ask", List.of(STEP_H_CAP_DETAILS)),
+            new ScriptStep("2F", "Her Details", List.of(STEP_H_CAPW_NAME, STEP_H_CAPW_BIRTHDAY, STEP_H_CAPW_MOBILE)),
+            new ScriptStep("2G", "Consent", List.of(STEP_H_CONSENT)),
+            // Here for the sparkle
+            new ScriptStep("1-Sparkle", "Show Me", List.of(STEP_S_SHOW_ME)),
+            new ScriptStep("1A", "Category", List.of(STEP_S_PICK_CATEGORY)),
+            new ScriptStep("1A-Budget", "Budget", List.of(STEP_S_BUDGET)),
+            new ScriptStep("1B", "Carousel", List.of(STEP_S_BROWSE_PRODUCTS)),
+            new ScriptStep("1C", "Added to List", List.of(STEP_S_ADDED_TO_LIST)),
+            new ScriptStep("1D", "Adding More", List.of(STEP_S_ADD_MORE)),
+            new ScriptStep("1I", "Keep Me Posted", List.of(STEP_S_REINFORCE)),
+            // Shared
+            new ScriptStep("C2", "Store Visit", List.of(STEP_BOOK_STORE_VISIT)),
+            new ScriptStep("E1", "Closed", List.of(STEP_CLOSED)));
+
+    /** Bot step value → its script step, for the table's Step column. */
+    private static final Map<String, ScriptStep> SCRIPT_STEP_BY_BOT_STEP = buildScriptStepByBotStep();
+
+    private static Map<String, ScriptStep> buildScriptStepByBotStep() {
+        Map<String, ScriptStep> scriptStepByBotStep = new HashMap<>();
+        for (ScriptStep scriptStep : SCRIPT_STEPS) {
+            for (String botStep : scriptStep.steps()) {
+                scriptStepByBotStep.put(botStep, scriptStep);
+            }
+        }
+        return scriptStepByBotStep;
+    }
+
+    /** All the table filters, checked and turned into query parameters. */
+    private record ConversationQuery(String pathType, DateWindow window, String category,
+                                     boolean filterByStep, List<String> steps,
+                                     String searchName, String searchPhone,
+                                     String sortColumn, String sortDirection) {
+    }
+
+    // ---------- summary cards ----------
+
+    /**
+     * Total Sessions = every row the table shows for this path and range (with no table filters),
+     * so it always matches "Showing N sessions" — and equals "Opener" on the Overview.
+     */
+    @Override
+    public Map<String, Object> getConversationsSummary(String flow, String range, String startDate, String endDate) {
+        DateWindow window = resolveDateTimeRange(range, startDate, endDate);
+        String pathType = flowToPathType(flow);
+        LocalDateTime from = window.from();
+        LocalDateTime to = window.to();
+
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("totalSessions",
+                dashboardRepo.countConversations(pathType, from, to, null, false, NO_STEP_FILTER, null, ""));
+        data.put("enteredDiscovery",
+                dashboardRepo.countSessionsWithButtonTapPrefix(TAP_CATEGORY_PREFIX, pathType, from, to));
+        data.put("carouselReached",
+                dashboardRepo.countSessionsReachedStep(carouselStepsFor(pathType), pathType, from, to));
+        // The Ishara exists only on the Wife path, so this is 0 on "Shopping for her" / "Here for the sparkle"
+        data.put("isharaSent", dashboardRepo.countSessionsWithLead(List.of(LEAD_HINT_SENT), pathType, from, to));
+        data.put("visitsBooked",
+                dashboardRepo.countSessionsWithLead(List.of(LEAD_STORE_VISIT_BOOKED), pathType, from, to));
+        data.put("flow", normaliseFlow(flow));
+        data.put("range", normaliseRange(range));
+        return data;
+    }
+
+    private List<String> carouselStepsFor(String pathType) {
+        if (pathType == null) return ALL_CAROUSEL_STEPS;
+        return switch (pathType) {
+            case TEMPLATE_WIFE -> List.of(STEP_W_BROWSE_PRODUCTS);
+            case TEMPLATE_HUSBAND -> List.of(STEP_H_BROWSE_PRODUCTS);
+            default -> List.of(STEP_S_BROWSE_PRODUCTS);
+        };
+    }
+
+    // ---------- the table ----------
+
+    @Override
+    public Map<String, Object> getConversations(ConversationFilters filters, int page) {
+        ConversationQuery query = buildConversationQuery(filters);
+        int safePage = Math.max(page, 0);
+        boolean showBudget = budgetShownFor(query.pathType());
+
+        long totalElements = countConversations(query);
+        List<DashboardRepository.ConversationRowProjection> rows =
+                findConversations(query, CONVERSATIONS_PAGE_SIZE, safePage * CONVERSATIONS_PAGE_SIZE);
+
+        LocalDateTime now = LocalDateTime.now();
+        List<Map<String, Object>> tableRows = new ArrayList<>();
+        for (DashboardRepository.ConversationRowProjection row : rows) {
+            tableRows.add(toTableRow(row, now, showBudget));
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("rows", tableRows);
+        result.put("showBudget", showBudget);
+        result.put("page", safePage);
+        result.put("size", CONVERSATIONS_PAGE_SIZE);
+        result.put("totalElements", totalElements);
+        result.put("totalPages", totalPages(totalElements));
+        result.put("flow", normaliseFlow(filters.flow()));
+        result.put("range", normaliseRange(filters.range()));
+        result.put("sort", query.sortColumn());
+        result.put("direction", query.sortDirection());
+        return result;
+    }
+
+    /**
+     * One table row. On "I'm celebrating" there is no budget at all, so the budget fields are left out;
+     * on the other tabs they are present, and null for Wife rows (shown blank).
+     */
+    private Map<String, Object> toTableRow(DashboardRepository.ConversationRowProjection row,
+                                           LocalDateTime now, boolean showBudget) {
+        ScriptStep scriptStep = SCRIPT_STEP_BY_BOT_STEP.get(row.getStep());
+
+        Map<String, Object> tableRow = new LinkedHashMap<>();
+        tableRow.put("sessionId", row.getSessionId());
+        tableRow.put("customerName", displayName(row.getCustomerName(), row.getPhone()));
+        tableRow.put("phone", maskPhone(row.getPhone()));
+        tableRow.put("flow", pathToFlow(row.getPath()));
+        tableRow.put("pathLabel", pathLabel(row.getPath()));
+        tableRow.put("stepCode", scriptStep == null ? null : scriptStep.code());
+        tableRow.put("stepLabel", scriptStep == null ? row.getStep() : scriptStep.label());
+        tableRow.put("status", conversationStatus(row, now));
+        tableRow.put("category", row.getCategory());
+        tableRow.put("categoryLabel", CATEGORY_LABELS.get(row.getCategory()));
+        if (showBudget) {
+            tableRow.put("budget", row.getBudget());
+            tableRow.put("budgetLabel", BUDGET_LABELS.get(row.getBudget()));
+        }
+        tableRow.put("startedAt", row.getStartedAt());
+        tableRow.put("lastActivity", row.getLastActivity());
+        tableRow.put("minutesAgo", row.getLastActivity() == null ? null
+                : ChronoUnit.MINUTES.between(row.getLastActivity(), now));
+        return tableRow;
+    }
+
+    // ---------- export ----------
+
+    /**
+     * The rows to export — the frontend turns them into CSV / PDF.
+     * scope = "page" → the 50 rows of that page; scope = "all" → every row for the filters,
+     * up to MAX_EXPORT_ROWS (truncated = true when there were more).
+     */
+    @Override
+    public Map<String, Object> exportConversations(ConversationFilters filters, String scope, int page) {
+        ConversationQuery query = buildConversationQuery(filters);
+        String exportScope = hasText(scope) ? scope.trim().toLowerCase() : "all";
+        if (!exportScope.equals("page") && !exportScope.equals("all")) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "scope must be page or all");
+        }
+        int safePage = Math.max(page, 0);
+        boolean currentPageOnly = exportScope.equals("page");
+        boolean showBudget = budgetShownFor(query.pathType());
+
+        long totalElements = countConversations(query);
+        List<DashboardRepository.ConversationRowProjection> rows = currentPageOnly
+                ? findConversations(query, CONVERSATIONS_PAGE_SIZE, safePage * CONVERSATIONS_PAGE_SIZE)
+                : findConversations(query, MAX_EXPORT_ROWS, 0);
+
+        LocalDateTime now = LocalDateTime.now();
+        List<Map<String, String>> exportRows = new ArrayList<>();
+        for (DashboardRepository.ConversationRowProjection row : rows) {
+            exportRows.add(toExportRow(row, now, showBudget));
+        }
+
+        boolean truncated = !currentPageOnly && totalElements > MAX_EXPORT_ROWS;
+        if (truncated) {
+            log.warn("stage=CONVERSATIONS_EXPORT_TRUNCATED total={} exported={}", totalElements, MAX_EXPORT_ROWS);
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("columns", showBudget
+                ? EXPORT_COLUMNS
+                : EXPORT_COLUMNS.stream().filter(column -> !column.equals("Budget")).toList());
+        result.put("rows", exportRows);
+        result.put("scope", exportScope);
+        result.put("page", safePage);
+        result.put("totalElements", totalElements);
+        result.put("totalPages", totalPages(totalElements));
+        result.put("exportedRows", exportRows.size());
+        result.put("truncated", truncated);
+        result.put("flow", normaliseFlow(filters.flow()));
+        result.put("range", normaliseRange(filters.range()));
+        return result;
+    }
+
+    /** Export rows carry the full phone number (the table masks it) and plain-text labels. */
+    private Map<String, String> toExportRow(DashboardRepository.ConversationRowProjection row,
+                                            LocalDateTime now, boolean showBudget) {
+        ScriptStep scriptStep = SCRIPT_STEP_BY_BOT_STEP.get(row.getStep());
+
+        Map<String, String> exportRow = new LinkedHashMap<>();
+        exportRow.put("Customer", textOrEmpty(row.getCustomerName()));
+        exportRow.put("Phone", formatPhone(row.getPhone()));
+        exportRow.put("Path", pathLabel(row.getPath()));
+        exportRow.put("Step", scriptStep == null ? textOrEmpty(row.getStep())
+                : scriptStep.code() + " · " + scriptStep.label());
+        exportRow.put("Status", conversationStatus(row, now));
+        exportRow.put("Category", textOrEmpty(CATEGORY_LABELS.get(row.getCategory())));
+        if (showBudget) {
+            exportRow.put("Budget", textOrEmpty(BUDGET_LABELS.get(row.getBudget())));
+        }
+        exportRow.put("Started At", row.getStartedAt() == null ? "" : row.getStartedAt().format(EXPORT_DATE_TIME));
+        exportRow.put("Last Activity", row.getLastActivity() == null ? "" : row.getLastActivity().format(EXPORT_DATE_TIME));
+        return exportRow;
+    }
+
+    /** The Wife path never asks a budget, so "I'm celebrating" has no Budget column at all. */
+    private boolean budgetShownFor(String pathType) {
+        return !TEMPLATE_WIFE.equals(pathType);
+    }
+
+    // ---------- shared by the table and the export ----------
+
+    private ConversationQuery buildConversationQuery(ConversationFilters filters) {
+        DateWindow window = resolveDateTimeRange(filters.range(), filters.from(), filters.to());
+        String pathType = flowToPathType(filters.flow());
+
+        // Category — a CAT_* value, or empty for all categories
+        String category = null;
+        if (hasText(filters.category()) && !"all".equalsIgnoreCase(filters.category().trim())) {
+            category = filters.category().trim().toUpperCase();
+            if (!CATEGORY_LABELS.containsKey(category)) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                        "category must be one of " + CATEGORY_LABELS.keySet());
+            }
+        }
+
+        // Step — the script code from the Step filter ("1B", "2A-Budget", or "1B · Carousel"); empty = all steps
+        boolean filterByStep = false;
+        List<String> steps = NO_STEP_FILTER;
+        if (hasText(filters.step()) && !isAllSteps(filters.step())) {
+            filterByStep = true;
+            steps = botStepsForFilter(filters.step());
+        }
+
+        // Search — name contains the text, or phone contains its digits
+        String searchName = null;
+        String searchPhone = "";
+        if (hasText(filters.search())) {
+            String searchText = filters.search().trim();
+            if (searchText.length() > MAX_SEARCH_LENGTH) {
+                searchText = searchText.substring(0, MAX_SEARCH_LENGTH);
+            }
+            searchName = "%" + escapeLikePattern(searchText) + "%";
+            String digits = searchText.replaceAll("\\D", "");
+            searchPhone = digits.isEmpty() ? "" : "%" + digits + "%";
+        }
+
+        // Sort — newest activity first unless a column header was clicked
+        String sortColumn = "lastActivity";
+        if (hasText(filters.sort())) {
+            sortColumn = SORT_COLUMNS.get(filters.sort().trim().toLowerCase());
+            if (sortColumn == null) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                        "sort must be customer, phone, path, step, category, budget or lastActivity");
+            }
+        }
+        String sortDirection = hasText(filters.direction()) ? filters.direction().trim().toLowerCase() : "desc";
+        if (!sortDirection.equals("asc") && !sortDirection.equals("desc")) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "direction must be asc or desc");
+        }
+
+        return new ConversationQuery(pathType, window, category, filterByStep, steps,
+                searchName, searchPhone, sortColumn, sortDirection);
+    }
+
+    private List<DashboardRepository.ConversationRowProjection> findConversations(ConversationQuery query,
+                                                                                  int limit, int offset) {
+        return dashboardRepo.findConversationsPage(query.pathType(), query.window().from(), query.window().to(),
+                query.category(), query.filterByStep(), query.steps(),
+                query.searchName(), query.searchPhone(),
+                query.sortColumn(), query.sortDirection(), limit, offset);
+    }
+
+    private long countConversations(ConversationQuery query) {
+        return dashboardRepo.countConversations(query.pathType(), query.window().from(), query.window().to(),
+                query.category(), query.filterByStep(), query.steps(),
+                query.searchName(), query.searchPhone());
+    }
+
+    /**
+     * Completed = the journey reached E1.
+     * Ended = closed without finishing (she tapped a Step 0 button again, which starts a new session).
+     * Idle = no reply for longer than the idle nudge time. Active = everything else.
+     */
+    private String conversationStatus(DashboardRepository.ConversationRowProjection row, LocalDateTime now) {
+        String sessionState = row.getSessionState() == null ? "" : row.getSessionState();
+        switch (sessionState) {
+            case "COMPLETED":
+                return "Completed";
+            case "ENDED":
+                return "Ended";
+            default:
+                LocalDateTime idleCutoff = now.minusMinutes(idleMinutes);
+                if (row.getLastActivity() != null && row.getLastActivity().isBefore(idleCutoff)) return "Idle";
+                return "Active";
+        }
+    }
+
+    private boolean isAllSteps(String step) {
+        String value = step.trim().toLowerCase();
+        return value.equals("all") || value.equals("all steps");
+    }
+
+    /**
+     * The bot steps behind one Step-filter option. Accepts the code ("1B"), the dropdown text
+     * ("1B · Carousel") or, if the frontend sends only a label, the label ("Carousel" → 1B and 2B).
+     */
+    private List<String> botStepsForFilter(String step) {
+        String value = step.trim();
+        String code = value.contains("·") ? value.substring(0, value.indexOf('·')).trim() : value;
+
+        List<ScriptStep> matches = SCRIPT_STEPS.stream()
+                .filter(scriptStep -> sameCode(scriptStep.code(), code))
+                .toList();
+        if (matches.isEmpty() && !value.contains("·")) {
+            matches = SCRIPT_STEPS.stream()
+                    .filter(scriptStep -> scriptStep.label().equalsIgnoreCase(value))
+                    .toList();
+        }
+        if (matches.isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "step must be one of "
+                    + SCRIPT_STEPS.stream().map(ScriptStep::code).distinct().toList());
+        }
+        return matches.stream().flatMap(scriptStep -> scriptStep.steps().stream()).toList();
+    }
+
+    /** "2a-budget" = "2A-Budget", "1i nudge" = "1I-nudge" — case, spaces and dashes don't matter. */
+    private boolean sameCode(String code, String requested) {
+        return code.replaceAll("[^A-Za-z0-9]", "").equalsIgnoreCase(requested.replaceAll("[^A-Za-z0-9]", ""));
+    }
+
+    private long totalPages(long totalElements) {
+        return (totalElements + CONVERSATIONS_PAGE_SIZE - 1) / CONVERSATIONS_PAGE_SIZE;
+    }
+
+    /** LIKE treats % and _ as wildcards — escape them so a search for "50_" means exactly that. */
+    private String escapeLikePattern(String text) {
+        return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_");
+    }
+
+    private String pathToFlow(String path) {
+        if (path == null) return null;
+        return switch (path) {
+            case TEMPLATE_WIFE -> "celebrating";
+            case TEMPLATE_HUSBAND -> "shopping";
+            case TEMPLATE_SPARKLE -> "sparkle";
+            default -> path.toLowerCase();
+        };
+    }
+
+    private String pathLabel(String path) {
+        if (path == null) return "";
+        return switch (path) {
+            case TEMPLATE_WIFE -> "Celebrating";
+            case TEMPLATE_HUSBAND -> "Shopping for her";
+            case TEMPLATE_SPARKLE -> "Sparkle";
+            default -> path;
+        };
+    }
+
+    /** "919835912846" → "+91 98359 ••846" — the table never needs the full number. */
+    private String maskPhone(String phone) {
+        if (phone == null || phone.length() < 4) return "";
+        if (phone.length() == 12 && phone.startsWith("91")) {
+            return "+91 " + phone.substring(2, 7) + " ••" + phone.substring(9);
+        }
+        return "••" + phone.substring(phone.length() - 4);
+    }
+
+    /** "919835912846" → "+91 98359 12846" — used in exports. */
+    private String formatPhone(String phone) {
+        if (phone == null) return "";
+        if (phone.length() == 12 && phone.startsWith("91")) {
+            return "+91 " + phone.substring(2, 7) + " " + phone.substring(7);
+        }
+        return "+" + phone;
+    }
+
+    private String textOrEmpty(String value) {
+        return value == null ? "" : value;
+    }
+
+    /** Map.of doesn't keep order — labels need to stay in this order. */
+    private static Map<String, String> orderedMap(String... keysAndValues) {
+        Map<String, String> map = new LinkedHashMap<>();
+        for (int i = 0; i < keysAndValues.length; i += 2) {
+            map.put(keysAndValues[i], keysAndValues[i + 1]);
+        }
+        return map;
+    }
+
+    // ==================================================================
+    // STORE VISITS PAGE
+    // Bookings come from the C2 WhatsApp Flow (bookings table), counted by when they were made.
+    // Cancelled bookings are left out everywhere.
+    // ==================================================================
+
+    private static final int BOOKINGS_PAGE_SIZE = 50;
+    private static final DateTimeFormatter WEEKDAY = DateTimeFormatter.ofPattern("EEE", Locale.ENGLISH);
+
+    /**
+     * Visits Booked, Booking Form Opened (with the share that went on to book) and Most Picked Slot.
+     * Booking Form Opened = sessions that reached C2 (tapped "Visit nearby store") in the window.
+     */
+    @Override
+    public Map<String, Object> getStoreVisitsSummary(String flow, String range, String startDate, String endDate) {
+        DateWindow window = resolveDateTimeRange(range, startDate, endDate);
+        String pathType = flowToPathType(flow);
+
+        long visitsBooked = dashboardRepo.countBookings(pathType, window.from(), window.to());
+        long bookingFormOpened = dashboardRepo.countSessionsOpenedBookingForm(pathType, window.from(), window.to());
+        List<DashboardRepository.SlotCountProjection> topSlot =
+                dashboardRepo.findMostPickedSlot(pathType, window.from(), window.to());
+
+        Map<String, Object> mostPickedSlot = new LinkedHashMap<>();
+        if (topSlot.isEmpty()) {
+            mostPickedSlot.put("timeSlot", null);
+            mostPickedSlot.put("bookings", 0L);
+            mostPickedSlot.put("pctOfBookings", 0.0);
+        } else {
+            long slotBookings = valueOrZero(topSlot.get(0).getTotal());
+            mostPickedSlot.put("timeSlot", topSlot.get(0).getTimeSlot());
+            mostPickedSlot.put("bookings", slotBookings);
+            mostPickedSlot.put("pctOfBookings", pct(slotBookings, visitsBooked));
+        }
+
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("visitsBooked", visitsBooked);
+        data.put("bookingFormOpened", bookingFormOpened);
+        data.put("completedPct", pct(visitsBooked, bookingFormOpened));
+        data.put("mostPickedSlot", mostPickedSlot);
+        data.put("flow", normaliseFlow(flow));
+        data.put("range", normaliseRange(range));
+        return data;
+    }
+
+    /** Recent Bookings — newest first, 50 per page. */
+    @Override
+    public Map<String, Object> getStoreBookings(String flow, String range, String startDate, String endDate, int page) {
+        DateWindow window = resolveDateTimeRange(range, startDate, endDate);
+        String pathType = flowToPathType(flow);
+        int safePage = Math.max(page, 0);
+
+        long totalElements = dashboardRepo.countBookings(pathType, window.from(), window.to());
+        List<DashboardRepository.BookingRowProjection> rows = dashboardRepo.findBookingsPage(
+                pathType, window.from(), window.to(), BOOKINGS_PAGE_SIZE, safePage * BOOKINGS_PAGE_SIZE);
+
+        LocalDateTime now = LocalDateTime.now();
+        List<Map<String, Object>> bookings = new ArrayList<>();
+        for (DashboardRepository.BookingRowProjection row : rows) {
+            bookings.add(toBookingRow(row, now));
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("rows", bookings);
+        result.put("page", safePage);
+        result.put("size", BOOKINGS_PAGE_SIZE);
+        result.put("totalElements", totalElements);
+        result.put("totalPages", (totalElements + BOOKINGS_PAGE_SIZE - 1) / BOOKINGS_PAGE_SIZE);
+        result.put("flow", normaliseFlow(flow));
+        result.put("range", normaliseRange(range));
+        return result;
+    }
+
+    private Map<String, Object> toBookingRow(DashboardRepository.BookingRowProjection row, LocalDateTime now) {
+        List<String> reservedSkus = row.getReservedSkus() == null ? List.of()
+                : Arrays.stream(row.getReservedSkus().split(",")).map(String::trim).filter(this::hasText).toList();
+
+        Map<String, Object> booking = new LinkedHashMap<>();
+        booking.put("bookingId", row.getBookingId());
+        booking.put("bookingRef", row.getBookingRef());
+        booking.put("customerName", displayName(row.getCustomerName(), row.getPhone()));
+        booking.put("phone", maskPhone(row.getPhone()));
+        booking.put("flow", pathToFlow(row.getPath()));
+        booking.put("pathLabel", pathLabel(row.getPath()));
+        booking.put("storeName", row.getStoreName());
+        booking.put("visitDate", row.getVisitDate());
+        booking.put("timeSlot", row.getTimeSlot());
+        booking.put("slotLabel", slotLabel(row.getVisitDate(), row.getTimeSlot()));
+        booking.put("reservedLabel", reservedLabel(reservedSkus, row.getReservedProductName()));
+        booking.put("reservedSkus", reservedSkus);
+        booking.put("status", row.getStatus());
+        booking.put("bookedAt", row.getBookedAt());
+        booking.put("minutesAgo", row.getBookedAt() == null ? null
+                : ChronoUnit.MINUTES.between(row.getBookedAt(), now));
+        return booking;
+    }
+
+    /** "Today, 4:00 pm" / "Tomorrow, 6:30 pm" / "Sat, 12:30 pm" (within a week) / "18 Oct, 11:00 am". */
+    private String slotLabel(LocalDate visitDate, String timeSlot) {
+        String day = "";
+        if (visitDate != null) {
+            LocalDate today = LocalDate.now();
+            long daysAhead = ChronoUnit.DAYS.between(today, visitDate);
+            if (daysAhead == 0) day = "Today";
+            else if (daysAhead == 1) day = "Tomorrow";
+            else if (daysAhead > 1 && daysAhead < 7) day = visitDate.format(WEEKDAY);
+            else day = visitDate.format(DAY_MONTH);
+        }
+        String slot = timeSlot == null ? "" : timeSlot.trim();
+        if (day.isEmpty()) return slot;
+        return slot.isEmpty() ? day : day + ", " + slot;
+    }
+
+    /** One piece → its name (SKU if the catalogue doesn't have it); several → "Wishlist"; none → null. */
+    private String reservedLabel(List<String> reservedSkus, String productName) {
+        if (reservedSkus.isEmpty()) return null;
+        if (reservedSkus.size() > 1) return "Wishlist";
+        return hasText(productName) ? productName : reservedSkus.get(0);
     }
 
     // ==================================================================

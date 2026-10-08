@@ -4,6 +4,8 @@ import java.util.Map;
 
 public interface DashboardService {
 
+    // ---------------- Overview page ----------------
+
     Map<String, Object> getMetricCards(String flow, String range, String startDate, String endDate);
 
     Map<String, Object> getOutcomes(String flow, String range, String startDate, String endDate);
@@ -13,4 +15,34 @@ public interface DashboardService {
     Map<String, Object> getActivity(String flow, String range, String startDate, String endDate, int limit);
 
     Map<String, Object> getPathsSummary(String range, String startDate, String endDate);
+
+    // ---------------- Conversations page ----------------
+
+    Map<String, Object> getConversationsSummary(String flow, String range, String startDate, String endDate);
+
+    Map<String, Object> getConversations(ConversationFilters filters, int page);
+
+    Map<String, Object> exportConversations(ConversationFilters filters, String scope, int page);
+
+    // ---------------- Store Visits page ----------------
+
+    Map<String, Object> getStoreVisitsSummary(String flow, String range, String startDate, String endDate);
+
+    Map<String, Object> getStoreBookings(String flow, String range, String startDate, String endDate, int page);
+
+    /**
+     * Every filter on the Conversations page — the controller builds it from the request params.
+     *
+     * flow      : all / celebrating / shopping / sparkle
+     * range     : today / 7d / 30d / custom   (custom needs from + to, yyyy-MM-dd)
+     * category  : a category value, e.g. RINGS (empty = all categories)
+     * step      : a flow-script step code — "1B", "2A-Budget", "1I-nudge" or "1B · Carousel"; empty = all steps
+     * search    : part of the customer's name or phone number
+     * sort      : customer / phone / path / step / category / budget / lastActivity
+     * direction : asc / desc
+     */
+    record ConversationFilters(String flow, String range, String from, String to,
+                               String category, String step, String search,
+                               String sort, String direction) {
+    }
 }

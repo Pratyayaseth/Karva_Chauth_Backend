@@ -326,4 +326,216 @@ public interface DashboardRepository extends JpaRepository<Lead, Long> {
                                                    @Param("from") LocalDateTime from,
                                                    @Param("to") LocalDateTime to,
                                                    @Param("limit") int limit);
+
+    // ==================================================================
+    // CONVERSATIONS PAGE — one row per session (sessions started in the window)
+    //
+    // The SQL is split into three pieces so the page query and the count query
+    // always use exactly the same rows and filters.
+    // ==================================================================
+
+    /**
+     * The table's rows — one per session she started by tapping a Step 0 button (path IS NOT NULL).
+     * A template she never tapped (session on OPENER with no path) is left out.
+     *
+     *   step         : where she got to. For a finished journey (current_step = 'CLOSED') it is the step
+     *                  she finished from — the step of her last message before the goodbye
+     *                  (moveTo saves the goodbye itself on CLOSED).
+     *   sessionState : COMPLETED   — the journey reached E1 (CLOSED)
+     *                  OPEN        — still going
+     *                  ENDED       — closed without finishing (a new Step 0 tap started a new session)
+     *   lastActivity : her last reply (the Step 0 tap counts), or when the session started if none.
+     */
+    String CONVERSATION_ROWS =
+            "SELECT s.id AS sessionId, c.name AS customerName, s.phone AS phone, s.path AS path, " +
+                    "       CASE WHEN s.current_step = 'CLOSED' " +
+                    "            THEN (SELECT m.step FROM messages m " +
+                    "                  WHERE m.session_id = s.id AND m.step <> 'CLOSED' " +
+                    "                  ORDER BY m.id DESC LIMIT 1) " +
+                    "            ELSE s.current_step END AS step, " +
+                    "       s.current_step AS currentStep, " +
+                    "       CASE WHEN s.current_step = 'CLOSED' THEN 'COMPLETED' " +
+                    "            WHEN s.is_active THEN 'OPEN' " +
+                    "            ELSE 'ENDED' END AS sessionState, " +
+                    "       s.selected_category AS category, s.selected_budget AS budget, " +
+                    "       s.started_at AS startedAt, COALESCE(s.last_inbound_at, s.started_at) AS lastActivity " +
+                    "FROM sessions s " +
+                    "LEFT JOIN customers c ON c.id = s.customer_id " +
+                    "WHERE s.path IS NOT NULL " +
+                    "  AND (:path IS NULL OR s.path = :path) " +
+                    "  AND s.started_at >= :from AND s.started_at < :to";
+
+    /**
+     * Table filters. Unused filters are passed as NULL / filterByStep = false.
+     * The step filter matches the step she got to, or the current step — the latter only
+     * matters for 'CLOSED' (E1), since a finished journey shows the step it ended on.
+     * searchName is a LIKE pattern on the name; searchPhone is a LIKE pattern on the digits
+     * of the search text ('' when the text has no digits, which matches no phone).
+     */
+    String CONVERSATION_FILTERS =
+            " WHERE (:category IS NULL OR conversation.category = :category) " +
+                    "   AND (:filterByStep = FALSE " +
+                    "        OR conversation.step IN (:steps) " +
+                    "        OR conversation.currentStep IN (:steps)) " +
+                    "   AND (:searchName IS NULL " +
+                    "        OR conversation.customerName LIKE :searchName " +
+                    "        OR conversation.phone LIKE :searchPhone)";
+
+    /**
+     * The value a column header sorts on. Step and budget sort in journey / price order,
+     * not alphabetically. Everything is turned into text so one CASE can hold every column.
+     */
+    String CONVERSATION_SORT_VALUE =
+            "CASE :sortColumn " +
+                    "  WHEN 'customer' THEN LOWER(conversation.customerName) " +
+                    "  WHEN 'phone'    THEN conversation.phone " +
+                    "  WHEN 'path'     THEN conversation.path " +
+                    "  WHEN 'step'     THEN LPAD(FIELD(conversation.step, " +
+                    "                      'OPENER', 'W_CHOOSE_MY_GIFT', 'H_FIND_HER_GIFT', 'S_SHOW_ME', " +
+                    "                      'W_PICK_CATEGORY', 'H_PICK_CATEGORY', 'S_PICK_CATEGORY', " +
+                    "                      'W_BUDGET', 'H_BUDGET', 'S_BUDGET', " +
+                    "                      'W_BROWSE_PRODUCTS', 'W_ADD_MORE', 'H_BROWSE_PRODUCTS', 'S_BROWSE_PRODUCTS', 'S_ADD_MORE', " +
+                    "                      'W_ADDED_TO_LIST', 'S_ADDED_TO_LIST', 'H_CONFIRM_CHOICE', " +
+                    "                      'W_HINT_READY', 'W_STORE_INVITE', 'BOOK_STORE_VISIT', " +
+                    "                      'W_REINFORCE', 'W_REINFORCE_NUDGE', 'S_REINFORCE', 'H_CAP_DETAILS', " +
+                    "                      'W_CAPH_NAME', 'W_CAPH_ANNIVERSARY', 'W_CAPH_MOBILE', " +
+                    "                      'H_CAPW_NAME', 'H_CAPW_BIRTHDAY', 'H_CAPW_MOBILE', " +
+                    "                      'W_CONSENT', 'H_CONSENT', 'CLOSED'), 3, '0') " +
+                    "  WHEN 'category' THEN conversation.category " +
+                    "  WHEN 'budget'   THEN LPAD(FIELD(conversation.budget, 'UNDER_50K', '50_100K', '100_200K', 'ABOVE_200K'), 3, '0') " +
+                    "  ELSE DATE_FORMAT(conversation.lastActivity, '%Y%m%d%H%i%s') " +
+                    "END";
+
+    interface ConversationRowProjection {
+        Long getSessionId();
+        String getCustomerName();
+        String getPhone();
+        String getPath();
+        String getStep();            // where she got to (see CONVERSATION_ROWS)
+        String getCurrentStep();     // raw current step — 'CLOSED' for a finished journey
+        String getSessionState();    // OPEN / COMPLETED / ENDED
+        String getCategory();
+        String getBudget();
+        LocalDateTime getStartedAt();
+        LocalDateTime getLastActivity();
+    }
+
+    /** One page of the table. Export uses the same query (limit = page size, or the export cap). */
+    @Query(nativeQuery = true, value =
+            "SELECT * FROM ( " +
+                    "  SELECT conversation.*, " + CONVERSATION_SORT_VALUE + " AS sortValue " +
+                    "  FROM (" + CONVERSATION_ROWS + ") conversation " +
+                    CONVERSATION_FILTERS +
+                    ") filtered " +
+                    "ORDER BY CASE WHEN :sortDirection = 'asc'  THEN filtered.sortValue END ASC, " +
+                    "         CASE WHEN :sortDirection = 'desc' THEN filtered.sortValue END DESC, " +
+                    "         filtered.lastActivity DESC, filtered.sessionId DESC " +
+                    "LIMIT :limit OFFSET :offset")
+    List<ConversationRowProjection> findConversationsPage(@Param("path") String path,
+                                                          @Param("from") LocalDateTime from,
+                                                          @Param("to") LocalDateTime to,
+                                                          @Param("category") String category,
+                                                          @Param("filterByStep") boolean filterByStep,
+                                                          @Param("steps") List<String> steps,
+                                                          @Param("searchName") String searchName,
+                                                          @Param("searchPhone") String searchPhone,
+                                                          @Param("sortColumn") String sortColumn,
+                                                          @Param("sortDirection") String sortDirection,
+                                                          @Param("limit") int limit,
+                                                          @Param("offset") int offset);
+
+    /** Total rows for the same filters — drives "Page 1 of 3" and the export cap check. */
+    @Query(nativeQuery = true, value =
+            "SELECT COUNT(*) FROM (" + CONVERSATION_ROWS + ") conversation " + CONVERSATION_FILTERS)
+    long countConversations(@Param("path") String path,
+                            @Param("from") LocalDateTime from,
+                            @Param("to") LocalDateTime to,
+                            @Param("category") String category,
+                            @Param("filterByStep") boolean filterByStep,
+                            @Param("steps") List<String> steps,
+                            @Param("searchName") String searchName,
+                            @Param("searchPhone") String searchPhone);
+
+    // ==================================================================
+    // STORE VISITS PAGE — bookings from the C2 WhatsApp Flow (event window on bookings.created_at)
+    //
+    // A booking row is written when she submits the booking form. Cancelled bookings are left out
+    // of every number and of the table.
+    // ==================================================================
+
+    /** Bookings made in the window (not cancelled). */
+    @Query(nativeQuery = true, value =
+            "SELECT COUNT(*) FROM bookings b " +
+                    "WHERE b.status <> 'CANCELLED' " +
+                    "  AND (:path IS NULL OR b.path = :path) " +
+                    "  AND b.created_at >= :from AND b.created_at < :to")
+    long countBookings(@Param("path") String path,
+                       @Param("from") LocalDateTime from,
+                       @Param("to") LocalDateTime to);
+
+    /**
+     * Sessions that got to C2 in the window — she tapped "Visit nearby store" / "Visit Store",
+     * which puts the session on BOOK_STORE_VISIT, where the booking form is sent.
+     */
+    @Query(nativeQuery = true, value =
+            "SELECT COUNT(DISTINCT m.session_id) FROM messages m " +
+                    "WHERE m.step = 'BOOK_STORE_VISIT' " +
+                    "  AND (:path IS NULL OR m.path = :path) " +
+                    "  AND m.created_at >= :from AND m.created_at < :to")
+    long countSessionsOpenedBookingForm(@Param("path") String path,
+                                        @Param("from") LocalDateTime from,
+                                        @Param("to") LocalDateTime to);
+
+    interface SlotCountProjection {
+        String getTimeSlot();
+        Long getTotal();
+    }
+
+    /** The time slot picked most often (ties → the earlier one alphabetically). */
+    @Query(nativeQuery = true, value =
+            "SELECT b.time_slot AS timeSlot, COUNT(*) AS total FROM bookings b " +
+                    "WHERE b.status <> 'CANCELLED' AND b.time_slot IS NOT NULL " +
+                    "  AND (:path IS NULL OR b.path = :path) " +
+                    "  AND b.created_at >= :from AND b.created_at < :to " +
+                    "GROUP BY b.time_slot " +
+                    "ORDER BY total DESC, b.time_slot " +
+                    "LIMIT 1")
+    List<SlotCountProjection> findMostPickedSlot(@Param("path") String path,
+                                                 @Param("from") LocalDateTime from,
+                                                 @Param("to") LocalDateTime to);
+
+    interface BookingRowProjection {
+        Long getBookingId();
+        String getBookingRef();
+        String getCustomerName();
+        String getPhone();
+        String getPath();
+        String getStoreName();
+        LocalDate getVisitDate();
+        String getTimeSlot();
+        String getReservedSkus();        // comma-separated
+        String getReservedProductName(); // name of the piece when exactly one was reserved
+        String getStatus();
+        LocalDateTime getBookedAt();
+    }
+
+    /** One page of bookings, newest first. */
+    @Query(nativeQuery = true, value =
+            "SELECT b.id AS bookingId, b.booking_ref AS bookingRef, c.name AS customerName, b.phone AS phone, " +
+                    "       b.path AS path, b.store_name AS storeName, b.visit_date AS visitDate, " +
+                    "       b.time_slot AS timeSlot, b.reserved_skus AS reservedSkus, " +
+                    "       p.name AS reservedProductName, b.status AS status, b.created_at AS bookedAt " +
+                    "FROM bookings b " +
+                    "LEFT JOIN customers c ON c.id = b.customer_id " +
+                    "LEFT JOIN products p ON p.sku = b.reserved_skus " +     // matches only a single SKU
+                    "WHERE b.status <> 'CANCELLED' " +
+                    "  AND (:path IS NULL OR b.path = :path) " +
+                    "  AND b.created_at >= :from AND b.created_at < :to " +
+                    "ORDER BY b.created_at DESC, b.id DESC " +
+                    "LIMIT :limit OFFSET :offset")
+    List<BookingRowProjection> findBookingsPage(@Param("path") String path,
+                                                @Param("from") LocalDateTime from,
+                                                @Param("to") LocalDateTime to,
+                                                @Param("limit") int limit,
+                                                @Param("offset") int offset);
 }
